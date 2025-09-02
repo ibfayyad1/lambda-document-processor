@@ -328,9 +328,9 @@ class EnhancedDocumentProcessor:
     # ========================================
     
     def _process_pdf_with_advanced_image_handling(self, file_path: str) -> Dict[str, Any]:
-        """ADVANCED PDF processing with complete image detection, deduplication, and spatial positioning"""
+        """FIXED ADVANCED PDF processing with WORKING duplicate detection using proper PyMuPDF methods"""
         
-        logger.info("Starting ADVANCED PDF processing with complete image handling...")
+        logger.info("Starting FIXED ADVANCED PDF processing with working duplicate detection...")
         
         try:
             # Open PDF document
@@ -339,30 +339,30 @@ class EnhancedDocumentProcessor:
             
             logger.info(f"PDF opened successfully: {pages_processed} pages")
             
-            # PHASE 1: ADVANCED MULTI-METHOD IMAGE DETECTION
-            logger.info("PHASE 1: Advanced multi-method image detection...")
-            all_detected_images = self._detect_all_images_advanced(pdf_doc)
-            logger.info(f"Detected {len(all_detected_images)} total image instances using advanced methods")
+            # PHASE 1: COLLECT ALL IMAGE XREFS FROM ALL PAGES
+            logger.info("PHASE 1: Collecting all image xrefs from all pages...")
+            all_page_images = self._collect_all_image_xrefs(pdf_doc)
+            logger.info(f"Collected {len(all_page_images)} total image occurrences across all pages")
             
-            # PHASE 2: HASH-BASED DUPLICATE DETECTION
-            logger.info("PHASE 2: Hash-based duplicate detection...")
-            unique_images, duplicate_groups = self._identify_duplicates_advanced(pdf_doc, all_detected_images)
-            logger.info(f"Identified {len(unique_images)} unique images in {len(duplicate_groups)} duplicate groups")
+            # PHASE 2: FIXED DUPLICATE DETECTION USING ACTUAL IMAGE CONTENT
+            logger.info("PHASE 2: FIXED duplicate detection using actual image content...")
+            unique_images, duplicate_mapping = self._detect_duplicates_by_content(pdf_doc, all_page_images)
+            logger.info(f"FIXED detection found {len(unique_images)} unique images with {len(duplicate_mapping)} total groups")
             
-            # PHASE 3: SPATIAL TEXT EXTRACTION WITH POSITIONING
-            logger.info("PHASE 3: Spatial text extraction with positioning...")
+            # PHASE 3: EXTRACT TEXT WITH POSITIONING
+            logger.info("PHASE 3: Extracting text with spatial positioning...")
             text_blocks_by_page = self._extract_text_with_spatial_info(pdf_doc)
             
-            # PHASE 4: INTELLIGENT IMAGE-TEXT INTEGRATION
-            logger.info("PHASE 4: Intelligent image-text integration...")
-            formatted_text = self._integrate_images_and_text_spatially(
-                pdf_doc, text_blocks_by_page, unique_images, duplicate_groups
+            # PHASE 4: CREATE INTEGRATED CONTENT WITH PROPER DUPLICATE HANDLING
+            logger.info("PHASE 4: Creating integrated content with proper duplicate handling...")
+            formatted_text = self._integrate_content_with_fixed_duplicates(
+                pdf_doc, text_blocks_by_page, all_page_images, unique_images, duplicate_mapping
             )
             
-            # PHASE 5: PROCESS AND UPLOAD IMAGES
-            logger.info("PHASE 5: Process and upload unique images...")
-            final_text = self._process_and_upload_unique_images(
-                pdf_doc, formatted_text, unique_images, duplicate_groups
+            # PHASE 5: UPLOAD ONLY UNIQUE IMAGES
+            logger.info("PHASE 5: Uploading only unique images...")
+            final_text = self._upload_unique_images_and_replace_duplicates(
+                formatted_text, unique_images, duplicate_mapping
             )
             
             # Generate plain text
@@ -370,141 +370,362 @@ class EnhancedDocumentProcessor:
             
             pdf_doc.close()
             
-            # Calculate statistics
-            total_image_instances = sum(len(group) for group in duplicate_groups.values())
+            # Calculate CORRECT statistics
+            total_image_instances = len(all_page_images)
             unique_images_count = len(unique_images)
+            duplicate_groups_count = len([group for group in duplicate_mapping.values() if len(group) > 1])
             
-            logger.info(f"ADVANCED PDF processing complete:")
+            logger.info(f"FIXED ADVANCED PDF processing complete:")
             logger.info(f"  - Pages processed: {pages_processed}")
             logger.info(f"  - Total image instances: {total_image_instances}")
             logger.info(f"  - Unique images: {unique_images_count}")
-            logger.info(f"  - Duplicate groups: {len(duplicate_groups)}")
+            logger.info(f"  - Duplicate groups: {duplicate_groups_count}")
             logger.info(f"  - Images uploaded: {len(self.processed_images)}")
             
             return {
                 'formatted_text': final_text,
                 'plain_text': plain_text,
-                'method': 'advanced_pdf_with_spatial_positioning_and_deduplication',
+                'method': 'fixed_advanced_pdf_with_working_duplicate_detection',
                 'pages_processed': pages_processed,
-                'total_image_references': len(all_detected_images),
+                'total_image_references': len(all_page_images),
                 'total_image_instances': total_image_instances,
                 'unique_image_files': unique_images_count,
                 'unique_images': unique_images_count,
-                'duplicate_groups': len(duplicate_groups),
+                'duplicate_groups': duplicate_groups_count,
                 'tables_count': self._count_tables_in_text(final_text),
                 'headings_count': self._count_headings_in_text(final_text)
             }
             
         except Exception as e:
-            logger.error(f"ADVANCED PDF processing failed: {e}")
+            logger.error(f"FIXED ADVANCED PDF processing failed: {e}")
             return self._fallback_pdf_extraction(file_path)
     
-    def _detect_all_images_advanced(self, pdf_doc) -> Dict[int, AdvancedImageInfo]:
-        """PHASE 1: Detect ALL images using multiple advanced methods"""
+    def _collect_all_image_xrefs(self, pdf_doc) -> List[Dict]:
+        """PHASE 1: Collect ALL image xrefs from all pages with position info"""
         
-        all_images = {}
-        detection_stats = defaultdict(int)
-        
-        logger.info("Starting comprehensive image detection across all pages...")
+        all_page_images = []
         
         for page_num in range(len(pdf_doc)):
             page = pdf_doc.load_page(page_num)
-            page_images = {}
             
-            # METHOD 1: Standard get_images() 
             try:
-                standard_images = page.get_images()
-                for img_idx, img_info in enumerate(standard_images):
+                # Get all images on this page
+                page_images = page.get_images()
+                
+                for img_idx, img_info in enumerate(page_images):
                     xref = img_info[0]
-                    if xref not in page_images:
-                        image_obj = AdvancedImageInfo(xref, page_num, img_idx)
-                        image_obj.extraction_methods.append('standard_get_images')
-                        page_images[xref] = image_obj
-                        detection_stats['standard_get_images'] += 1
-                    else:
-                        page_images[xref].extraction_methods.append('standard_get_images_duplicate')
-                        
+                    
+                    # Create image occurrence record
+                    occurrence = {
+                        'xref': xref,
+                        'page_num': page_num,
+                        'img_index': img_idx,
+                        'occurrence_id': len(all_page_images),
+                        'marker': f"__IMAGE_PLACEHOLDER_{len(all_page_images)}__"
+                    }
+                    
+                    all_page_images.append(occurrence)
+                    
+                    logger.debug(f"Found image xref={xref} on page {page_num + 1}")
+                
             except Exception as e:
-                logger.warning(f"Standard image detection failed for page {page_num}: {e}")
-            
-            # METHOD 2: Advanced get_images with full resolution
-            try:
-                full_images = page.get_images(full=True)
-                for img_idx, img_info in enumerate(full_images):
-                    xref = img_info[0]
-                    if xref not in page_images:
-                        image_obj = AdvancedImageInfo(xref, page_num, img_idx)
-                        image_obj.extraction_methods.append('full_resolution_get_images')
-                        # Store additional info from full detection
-                        if len(img_info) > 2:
-                            image_obj.width = img_info[2] if img_info[2] else 0
-                            image_obj.height = img_info[3] if img_info[3] else 0
-                        page_images[xref] = image_obj
-                        detection_stats['full_resolution_get_images'] += 1
-                    else:
-                        page_images[xref].extraction_methods.append('full_resolution_get_images_duplicate')
-                        
-            except Exception as e:
-                logger.warning(f"Full resolution image detection failed for page {page_num}: {e}")
-            
-            # METHOD 3: Drawing object detection
-            try:
-                drawing_images = self._detect_drawing_images(page, page_num)
-                for xref, image_obj in drawing_images.items():
-                    if xref not in page_images:
-                        image_obj.extraction_methods.append('drawing_object_detection')
-                        page_images[xref] = image_obj
-                        detection_stats['drawing_object_detection'] += 1
-                    else:
-                        page_images[xref].extraction_methods.append('drawing_object_detection_duplicate')
-                        
-            except Exception as e:
-                logger.warning(f"Drawing object detection failed for page {page_num}: {e}")
-            
-            # METHOD 4: XObject and Form detection
-            try:
-                xobject_images = self._detect_xobject_images(page, page_num)
-                for xref, image_obj in xobject_images.items():
-                    if xref not in page_images:
-                        image_obj.extraction_methods.append('xobject_detection')
-                        page_images[xref] = image_obj
-                        detection_stats['xobject_detection'] += 1
-                    else:
-                        page_images[xref].extraction_methods.append('xobject_detection_duplicate')
-                        
-            except Exception as e:
-                logger.warning(f"XObject detection failed for page {page_num}: {e}")
-            
-            # METHOD 5: Pattern and shading image detection
-            try:
-                pattern_images = self._detect_pattern_images(page, page_num)
-                for xref, image_obj in pattern_images.items():
-                    if xref not in page_images:
-                        image_obj.extraction_methods.append('pattern_detection')
-                        page_images[xref] = image_obj
-                        detection_stats['pattern_detection'] += 1
-                    else:
-                        page_images[xref].extraction_methods.append('pattern_detection_duplicate')
-                        
-            except Exception as e:
-                logger.warning(f"Pattern detection failed for page {page_num}: {e}")
-            
-            # METHOD 6: Multiple instance detection per page
-            try:
-                self._find_all_image_instances_on_page(page, page_num, page_images)
-            except Exception as e:
-                logger.warning(f"Multiple instance detection failed for page {page_num}: {e}")
-            
-            # Add page images to global collection
-            all_images.update(page_images)
-            
-            if page_images:
-                logger.info(f"Page {page_num + 1}: Found {len(page_images)} unique images")
-            
-        logger.info(f"Detection complete - Found {len(all_images)} total unique image xrefs")
-        logger.info(f"Detection method statistics: {dict(detection_stats)}")
+                logger.warning(f"Failed to get images from page {page_num + 1}: {e}")
         
-        return all_images
+        logger.info(f"Collected {len(all_page_images)} total image occurrences")
+        return all_page_images
+    
+    def _detect_duplicates_by_content(self, pdf_doc, all_page_images: List[Dict]) -> Tuple[List[Dict], Dict[str, List[Dict]]]:
+        """PHASE 2: FIXED duplicate detection using actual image content comparison"""
+        
+        logger.info("Starting FIXED duplicate detection using actual image content...")
+        
+        # Step 1: Extract unique xrefs
+        unique_xrefs = set()
+        xref_to_occurrences = defaultdict(list)
+        
+        for occurrence in all_page_images:
+            xref = occurrence['xref']
+            unique_xrefs.add(xref)
+            xref_to_occurrences[xref].append(occurrence)
+        
+        logger.info(f"Found {len(unique_xrefs)} unique xrefs from {len(all_page_images)} total occurrences")
+        
+        # Step 2: Extract actual image content for each unique xref
+        xref_to_content = {}
+        content_hash_to_xref = {}
+        
+        for xref in unique_xrefs:
+            try:
+                # Method 1: Try extract_image first (recommended)
+                try:
+                    img_dict = pdf_doc.extract_image(xref)
+                    if img_dict and 'image' in img_dict:
+                        image_data = img_dict['image']
+                        content_type = img_dict.get('ext', 'png')
+                        logger.debug(f"Extracted image data for xref={xref} using extract_image: {len(image_data)} bytes")
+                    else:
+                        raise Exception("extract_image returned no data")
+                        
+                except Exception:
+                    # Method 2: Fallback to Pixmap
+                    try:
+                        pix = fitz.Pixmap(pdf_doc, xref)
+                        if pix.n - pix.alpha < 4:  # Valid image
+                            image_data = pix.tobytes("png")
+                            content_type = 'png'
+                            logger.debug(f"Extracted image data for xref={xref} using Pixmap: {len(image_data)} bytes")
+                            pix = None
+                        else:
+                            logger.warning(f"Skipping complex image xref={xref}")
+                            continue
+                    except Exception as e:
+                        logger.warning(f"Failed to extract image data for xref={xref}: {e}")
+                        continue
+                
+                # Skip tiny images
+                if len(image_data) < MIN_IMAGE_SIZE_BYTES:
+                    logger.debug(f"Skipping tiny image xref={xref}: {len(image_data)} bytes")
+                    continue
+                
+                # Generate content hash
+                content_hash = hashlib.md5(image_data).hexdigest()
+                
+                # Store image data and hash
+                xref_to_content[xref] = {
+                    'image_data': image_data,
+                    'content_hash': content_hash,
+                    'content_type': content_type,
+                    'size_bytes': len(image_data)
+                }
+                
+                logger.debug(f"xref={xref} → hash={content_hash[:8]}..., size={len(image_data)} bytes")
+                
+            except Exception as e:
+                logger.warning(f"Failed to process xref={xref}: {e}")
+                continue
+        
+        # Step 3: Group by actual content hash (this is where duplicates are found)
+        hash_to_xrefs = defaultdict(list)
+        
+        for xref, content_info in xref_to_content.items():
+            content_hash = content_info['content_hash']
+            hash_to_xrefs[content_hash].append(xref)
+        
+        # Step 4: Identify unique images and duplicate groups
+        unique_images = []
+        duplicate_mapping = {}  # hash -> list of occurrences
+        
+        for content_hash, xref_list in hash_to_xrefs.items():
+            # Get all occurrences for all xrefs with this content hash
+            all_occurrences = []
+            for xref in xref_list:
+                all_occurrences.extend(xref_to_occurrences[xref])
+            
+            # Create master image entry (use first occurrence)
+            master_occurrence = all_occurrences[0]
+            master_xref = master_occurrence['xref']
+            content_info = xref_to_content[master_xref]
+            
+            unique_image = {
+                'master_xref': master_xref,
+                'content_hash': content_hash,
+                'image_data': content_info['image_data'],
+                'content_type': content_info['content_type'],
+                'size_bytes': content_info['size_bytes'],
+                'total_occurrences': len(all_occurrences),
+                'pages': [occ['page_num'] + 1 for occ in all_occurrences],
+                'all_occurrences': all_occurrences
+            }
+            
+            unique_images.append(unique_image)
+            duplicate_mapping[content_hash] = all_occurrences
+            
+            # Log duplicate information
+            if len(all_occurrences) > 1:
+                pages_str = ', '.join([str(occ['page_num'] + 1) for occ in all_occurrences])
+                logger.info(f"🎯 DUPLICATE DETECTED: hash={content_hash[:8]}... appears {len(all_occurrences)} times on pages: {pages_str}")
+            else:
+                logger.debug(f"✅ UNIQUE IMAGE: hash={content_hash[:8]}... on page {all_occurrences[0]['page_num'] + 1}")
+        
+        # Final statistics
+        total_duplicates = sum(1 for group in duplicate_mapping.values() if len(group) > 1)
+        logger.info(f"🔍 FIXED DUPLICATE DETECTION COMPLETE:")
+        logger.info(f"  - Unique content hashes: {len(hash_to_xrefs)}")
+        logger.info(f"  - Master images: {len(unique_images)}")
+        logger.info(f"  - Images with duplicates: {total_duplicates}")
+        
+        return unique_images, duplicate_mapping
+    
+    def _integrate_content_with_fixed_duplicates(self, pdf_doc, text_blocks_by_page: Dict[int, List[Dict]], 
+                                               all_page_images: List[Dict], unique_images: List[Dict], 
+                                               duplicate_mapping: Dict[str, List[Dict]]) -> str:
+        """PHASE 4: Create integrated content with proper duplicate handling"""
+        
+        logger.info("Creating integrated content with fixed duplicate handling...")
+        
+        formatted_parts = []
+        
+        for page_num in range(len(pdf_doc)):
+            logger.debug(f"Processing page {page_num + 1} for content integration")
+            
+            # Get text blocks for this page
+            page_text_blocks = text_blocks_by_page.get(page_num, [])
+            
+            # Get image occurrences for this page
+            page_image_occurrences = [occ for occ in all_page_images if occ['page_num'] == page_num]
+            
+            # Create page content with image placeholders
+            page_content = self._create_page_content_with_placeholders(
+                page_num, page_text_blocks, page_image_occurrences
+            )
+            
+            if page_content.strip():
+                formatted_parts.append(f"## Page {page_num + 1}\n\n{page_content}")
+        
+        return '\n\n'.join(formatted_parts)
+    
+    def _create_page_content_with_placeholders(self, page_num: int, text_blocks: List[Dict], 
+                                             image_occurrences: List[Dict]) -> str:
+        """Create page content with image placeholders positioned correctly"""
+        
+        # Simple approach: append text blocks, then add image placeholders
+        content_parts = []
+        
+        # Add all text blocks
+        for text_block in text_blocks:
+            content_parts.append(text_block.get('content', ''))
+        
+        # Add image placeholders
+        for occurrence in image_occurrences:
+            marker = occurrence['marker']
+            content_parts.append(f"\n{marker}\n*[Image from page {page_num + 1}]*")
+        
+        return '\n\n'.join(content_parts)
+    
+    def _upload_unique_images_and_replace_duplicates(self, formatted_text: str, unique_images: List[Dict], 
+                                                   duplicate_mapping: Dict[str, List[Dict]]) -> str:
+        """PHASE 5: Upload unique images and replace ALL duplicate occurrences"""
+        
+        logger.info(f"Uploading {len(unique_images)} unique images and replacing duplicates...")
+        
+        current_text = formatted_text
+        
+        for unique_image in unique_images:
+            try:
+                content_hash = unique_image['content_hash']
+                image_data = unique_image['image_data']
+                
+                # Create unique placeholder name
+                timestamp_suffix = int(time.time() * 1000) + self.image_counter
+                placeholder_name = f"PDF_IMAGE_{self.image_counter}_{timestamp_suffix}"
+                
+                # Upload to S3
+                s3_key = self._upload_unique_image_to_s3(image_data, placeholder_name, unique_image)
+                
+                if s3_key:
+                    # Get all occurrences for this content hash
+                    all_occurrences = duplicate_mapping[content_hash]
+                    
+                    # Store image info
+                    image_info = {
+                        'placeholder': placeholder_name,
+                        's3_key': s3_key,
+                        's3_filename': f"{placeholder_name}.png",
+                        'original_filename': f"pdf_unique_img_{unique_image['master_xref']}.png",
+                        'image_number': self.image_counter,
+                        'reference_number': unique_image['master_xref'],
+                        'page_number': unique_image['pages'][0],  # First occurrence page
+                        'size_bytes': unique_image['size_bytes'],
+                        'content_hash': content_hash,
+                        'is_master_image': True,
+                        'total_instances': len(all_occurrences),
+                        'instance_pages': unique_image['pages'],
+                        'uploaded': True,
+                        'upload_timestamp': datetime.utcnow().isoformat(),
+                        'source_type': 'pdf'
+                    }
+                    
+                    self.processed_images.append(image_info)
+                    self.placeholders[placeholder_name] = s3_key
+                    
+                    # Store in DynamoDB
+                    self._store_image_metadata(image_info)
+                    
+                    # Replace ALL occurrences of this image
+                    pages_str = ', '.join([str(p) for p in unique_image['pages']])
+                    placeholder_text = f"\n![{placeholder_name}]({s3_key})\n*PDF Image {self.image_counter} (appears on page(s): {pages_str})*\n"
+                    
+                    # Replace all markers for this image
+                    replaced_count = 0
+                    for occurrence in all_occurrences:
+                        marker = occurrence['marker']
+                        marker_count = current_text.count(marker)
+                        current_text = current_text.replace(marker, placeholder_text)
+                        replaced_count += marker_count
+                    
+                    logger.info(f"✅ Processed {placeholder_name}: {len(all_occurrences)} instances on pages {pages_str} ({replaced_count} markers replaced)")
+                    
+                    self.image_counter += 1
+                else:
+                    logger.error(f"Failed to upload unique image with hash {content_hash[:8]}...")
+                
+            except Exception as e:
+                logger.error(f"Failed to process unique image: {e}")
+                continue
+        
+        # Clean up any remaining markers
+        remaining_markers = len(re.findall(r'__IMAGE_PLACEHOLDER_\d+__', current_text))
+        if remaining_markers > 0:
+            logger.warning(f"Cleaning up {remaining_markers} unprocessed markers")
+            current_text = re.sub(r'__IMAGE_PLACEHOLDER_\d+__', '', current_text)
+        
+        # Clean up extra whitespace
+        current_text = re.sub(r'\n\s*\n\s*\n', '\n\n', current_text)
+        
+        logger.info(f"✅ Fixed duplicate processing complete: uploaded {len(self.processed_images)} unique images")
+        
+        return current_text.strip()
+    
+    def _upload_unique_image_to_s3(self, image_data: bytes, placeholder_name: str, unique_image: Dict) -> Optional[str]:
+        """Upload unique image to S3 with comprehensive metadata"""
+        
+        if not S3_BUCKET:
+            logger.error("S3_BUCKET not configured")
+            return None
+        
+        try:
+            timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d/%H')
+            s3_key = f"extracted_images/{timestamp_prefix}/{self.document_id}/{placeholder_name}.png"
+            
+            # Comprehensive metadata
+            metadata = {
+                'document_id': self.document_id,
+                'placeholder_name': placeholder_name,
+                'source_type': 'pdf_fixed_duplicate_detection',
+                'master_xref': str(unique_image['master_xref']),
+                'content_hash': unique_image['content_hash'][:32],  # Truncate for metadata limit
+                'total_instances': str(unique_image['total_instances']),
+                'pages': ','.join([str(p) for p in unique_image['pages']]),
+                'size_bytes': str(len(image_data)),
+                'content_type': unique_image.get('content_type', 'png'),
+                'upload_timestamp': datetime.utcnow().isoformat(),
+                'processing_timestamp': self.processing_timestamp
+            }
+            
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=s3_key,
+                Body=image_data,
+                ContentType=f"image/{unique_image.get('content_type', 'png')}",
+                Metadata=metadata
+            )
+            
+            logger.info(f"Fixed S3 Upload: {placeholder_name} → s3://{S3_BUCKET}/{s3_key}")
+            return s3_key
+            
+        except Exception as e:
+            logger.error(f"Fixed S3 upload failed for {placeholder_name}: {e}")
+            return None
     
     def _detect_drawing_images(self, page, page_num: int) -> Dict[int, AdvancedImageInfo]:
         """Detect images within drawing objects"""
@@ -2320,7 +2541,7 @@ class EnhancedDocumentProcessor:
         plain_text = re.sub(r'\*\*TABLE START\*\*\n', '', plain_text)  # Table markers
         plain_text = re.sub(r'\*\*TABLE END\*\*\n', '', plain_text)
         plain_text = re.sub(r'\|.*?\|', '', plain_text, flags=re.MULTILINE)  # Table content
-        plain_text = re.sub(r'^-+\|.*$', '', plain_text, flags=re.MULTILINE)  # Table separators
+        plain_text = re.sub(r'^-+\|.*, '', plain_text, flags=re.MULTILINE)  # Table separators
         plain_text = re.sub(r'!\[.*?\]\(.*?\)', '', plain_text)  # Image links
         
         # Clean up extra whitespace
