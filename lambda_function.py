@@ -2293,7 +2293,7 @@ class EnhancedDocumentProcessor:
         plain_text = re.sub(r'\*\*TABLE START\*\*\n', '', plain_text)  # Table markers
         plain_text = re.sub(r'\*\*TABLE END\*\*\n', '', plain_text)
         plain_text = re.sub(r'\|.*?\|', '', plain_text, flags=re.MULTILINE)  # Table content
-        plain_text = re.sub(r'^-+\|.*, '', plain_text, flags=re.MULTILINE)  # Table separators
+        plain_text = re.sub(r'^-+\|.*$', '', plain_text, flags=re.MULTILINE)  # Table separators
         plain_text = re.sub(r'!\[.*?\]\(.*?\)', '', plain_text)  # Image links
         
         # Clean up extra whitespace
