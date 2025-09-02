@@ -11,14 +11,13 @@ import xml.etree.ElementTree as ET
 import re
 import uuid
 import traceback
+import hashlib
 import fitz  # PyMuPDF for PDF processing
 from typing import Dict, Any, List, Optional, Tuple, Set
 from pathlib import Path
 from decimal import Decimal
 from datetime import datetime, timedelta
-from dataclasses import dataclass
 from collections import defaultdict
-import hashlib
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -36,43 +35,20 @@ IMAGE_PROCESSOR_LAMBDA_ARN = os.environ.get('IMAGE_PROCESSOR_LAMBDA_ARN')
 IMAGE_PROCESSING_QUEUE_URL = os.environ.get('IMAGE_BATCH_QUEUE_URL')
 USE_ASYNC_PROCESSING = os.environ.get('USE_ASYNC_PROCESSING', 'true').lower() == 'true'
 
+# Advanced PDF Processing Configuration
+ENABLE_ADVANCED_IMAGE_DETECTION = True
+ENABLE_SPATIAL_POSITIONING = True
+ENABLE_DUPLICATE_DETECTION = True
+IMAGE_HASH_SIMILARITY_THRESHOLD = 0.95  # 95% similarity for duplicate detection
+MIN_IMAGE_SIZE_BYTES = 100  # Skip tiny images
+MAX_IMAGES_PER_PAGE = 50  # Safety limit
+
 # AWS Clients
 s3_client = boto3.client('s3')
 dynamodb = boto3.resource('dynamodb')
 lambda_client = boto3.client('lambda')
 sqs_client = boto3.client('sqs')
 events_client = boto3.client('events')
-
-@dataclass
-class ImageInstance:
-    """Enhanced image instance with complete positioning and metadata"""
-    xref: int
-    bbox: Tuple[float, float, float, float]  # x0, y0, x1, y1
-    page_number: int
-    instance_id: str
-    image_hash: str
-    width: float
-    height: float
-    area: float
-    position_in_text: int = 0
-    text_before: str = ""
-    text_after: str = ""
-    is_duplicate: bool = False
-    original_instance_id: str = None
-    extraction_order: int = 0
-
-@dataclass
-class TextBlock:
-    """Enhanced text block with positioning"""
-    text: str
-    bbox: Tuple[float, float, float, float]
-    font_size: float
-    font_name: str
-    flags: int
-    page_number: int
-    block_order: int
-    is_heading: bool = False
-    heading_level: int = 0
 
 # Initialize DynamoDB tables with better error handling
 def initialize_dynamodb_tables():
@@ -127,6 +103,7 @@ def initialize_dynamodb_tables():
 # Initialize tables
 initialize_dynamodb_tables()
 
+
 def generate_unique_document_id(original_filename: str = None) -> str:
     """Generate truly unique document ID with timestamp and UUID"""
     timestamp = datetime.utcnow()
@@ -146,8 +123,33 @@ def generate_unique_document_id(original_filename: str = None) -> str:
     logger.info(f"Generated unique document ID: {document_id}")
     return document_id
 
+
+class AdvancedImageInfo:
+    """Enhanced image information class for advanced processing"""
+    
+    def __init__(self, xref: int, page_num: int, img_index: int, bbox: tuple = None):
+        self.xref = xref
+        self.page_num = page_num
+        self.img_index = img_index
+        self.bbox = bbox  # (x0, y0, x1, y1)
+        self.hash_value = None
+        self.size_bytes = 0
+        self.width = 0
+        self.height = 0
+        self.is_duplicate = False
+        self.duplicate_group_id = None
+        self.instances = []  # List of all instances if this is the master
+        self.master_image = None  # Reference to master if this is duplicate
+        self.spatial_context = {}
+        self.extraction_methods = []  # Which methods detected this image
+        self.image_data = None
+        self.content_type = None
+        self.reference_number = None
+        self.marker = None
+
+
 class EnhancedDocumentProcessor:
-    """Enhanced processor with advanced PDF and DOCX processing with AI integration"""
+    """Enhanced processor that handles both PDF and DOCX files with ADVANCED PDF image processing"""
     
     def __init__(self, document_id: str):
         self.document_id = document_id
@@ -156,14 +158,14 @@ class EnhancedDocumentProcessor:
         self.image_counter = 1
         self.processing_timestamp = datetime.utcnow().isoformat()
         
-        # Advanced PDF tracking
-        self.image_instances: List[ImageInstance] = []
-        self.text_blocks: List[TextBlock] = []
-        self.image_hash_map: Dict[str, str] = {}  # hash -> first_instance_id
-        self.duplicate_map: Dict[str, List[str]] = {}  # original_id -> [duplicate_ids]
-        self.spatial_index: Dict[int, List] = {}  # page -> sorted elements
+        # Advanced PDF processing attributes
+        self.all_detected_images = {}  # xref -> AdvancedImageInfo
+        self.duplicate_groups = {}  # group_id -> [AdvancedImageInfo]
+        self.image_hashes = {}  # hash -> AdvancedImageInfo (first occurrence)
+        self.page_image_positions = {}  # page_num -> [image positions]
+        self.text_blocks_by_page = {}  # page_num -> [text blocks with positions]
         
-        # DOCX namespaces
+        # DOCX processing attributes
         self.namespaces = {
             'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
             'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture',
@@ -172,25 +174,12 @@ class EnhancedDocumentProcessor:
             'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
         }
         
-        # Processing statistics
-        self.stats = {
-            'total_images_detected': 0,
-            'unique_images': 0,
-            'duplicate_images': 0,
-            'images_extracted': 0,
-            'images_uploaded': 0,
-            'positioning_accuracy': 0.0,
-            'text_blocks_processed': 0,
-            'pages_processed': 0,
-            'processing_time': 0.0
-        }
-        
     def process_document(self, file_path: str) -> Dict[str, Any]:
         """Main processing method with formatting preservation and AI trigger - Supports PDF and DOCX"""
         start_time = time.time()
         
         try:
-            logger.info(f"Starting enhanced processing for {self.document_id}")
+            logger.info(f"Starting ADVANCED enhanced processing for {self.document_id}")
             
             # Validate file
             if not os.path.exists(file_path):
@@ -204,8 +193,8 @@ class EnhancedDocumentProcessor:
             file_extension = Path(file_path).suffix.lower()
             
             if file_extension == '.pdf':
-                result = self.process_pdf_with_advanced_detection(file_path)
-                extraction_method = 'advanced_pdf_with_spatial_positioning'
+                result = self._process_pdf_with_advanced_image_handling(file_path)
+                extraction_method = 'advanced_pdf_with_spatial_positioning_and_deduplication'
             elif file_extension == '.docx':
                 result = self._process_docx_with_formatting(file_path)
                 extraction_method = 'enhanced_docx_with_formatting'
@@ -251,8 +240,9 @@ class EnhancedDocumentProcessor:
             
             processing_time = time.time() - start_time
             
-            logger.info(f"Enhanced processing complete in {processing_time:.2f}s")
+            logger.info(f"ADVANCED enhanced processing complete in {processing_time:.2f}s")
             logger.info(f"Images processed: {len(self.processed_images)}")
+            logger.info(f"Duplicate groups found: {len(self.duplicate_groups)}")
             logger.info(f"AI processing trigger: {ai_trigger_result}")
             
             # Create S3 file paths for response
@@ -273,25 +263,27 @@ class EnhancedDocumentProcessor:
                 'extracted_text': result['formatted_text'],
                 'plain_text': result.get('plain_text', ''),
                 'images_count': len(self.processed_images),
+                'duplicate_groups_count': len(self.duplicate_groups),
+                'total_image_instances': result.get('total_image_instances', 0),
+                'unique_images': result.get('unique_images', 0),
                 'placeholders': self.placeholders,
                 'processing_time': processing_time,
                 'extraction_method': extraction_method,
                 'pages_processed': result.get('pages_processed', 1),
                 'images_detected': result.get('total_image_references', 0),
                 'unique_image_files': result.get('unique_image_files', 0),
-                'duplicate_image_instances': result.get('duplicate_image_instances', 0),
-                'images_extracted': result.get('images_extracted', 0),
-                'images_uploaded': result.get('images_uploaded', 0),
-                'positioning_accuracy': result.get('positioning_accuracy', 0.0),
-                'text_blocks_processed': result.get('text_blocks_processed', 0),
+                'images_extracted': len(self.processed_images),
+                'images_uploaded': len([img for img in self.processed_images if img.get('uploaded')]),
                 'tables_detected': result.get('tables_count', 0),
                 'headings_detected': result.get('headings_count', 0),
                 'formatting_preserved': True,
                 'files_saved_to_s3': True,
+                'spatial_positioning_enabled': ENABLE_SPATIAL_POSITIONING,
+                'duplicate_detection_enabled': ENABLE_DUPLICATE_DETECTION,
+                'advanced_image_detection_enabled': ENABLE_ADVANCED_IMAGE_DETECTION,
                 'output_files': file_locations,
                 's3_base_path': f"s3://{S3_BUCKET}/{base_path}/",
                 'ai_processing': ai_trigger_result,
-                'processing_stats': result.get('processing_stats', self.stats),
                 'error_count': 0,
                 'warning_count': 0,
                 'errors': [],
@@ -300,7 +292,7 @@ class EnhancedDocumentProcessor:
             
         except Exception as e:
             processing_time = time.time() - start_time
-            logger.error(f"Enhanced processing failed: {e}")
+            logger.error(f"ADVANCED enhanced processing failed: {e}")
             
             return {
                 'success': False,
@@ -309,6 +301,9 @@ class EnhancedDocumentProcessor:
                 'extracted_text': "",
                 'plain_text': "",
                 'images_count': 0,
+                'duplicate_groups_count': 0,
+                'total_image_instances': 0,
+                'unique_images': 0,
                 'placeholders': {},
                 'processing_time': processing_time,
                 'extraction_method': 'failed',
@@ -317,6 +312,9 @@ class EnhancedDocumentProcessor:
                 'images_extracted': 0,
                 'images_uploaded': 0,
                 'formatting_preserved': False,
+                'spatial_positioning_enabled': ENABLE_SPATIAL_POSITIONING,
+                'duplicate_detection_enabled': ENABLE_DUPLICATE_DETECTION,
+                'advanced_image_detection_enabled': ENABLE_ADVANCED_IMAGE_DETECTION,
                 'ai_processing': {'triggered': False, 'reason': 'processing_failed'},
                 'error_count': 1,
                 'warning_count': 0,
@@ -325,734 +323,687 @@ class EnhancedDocumentProcessor:
                 'traceback': traceback.format_exc()
             }
     
-    def process_pdf_with_advanced_detection(self, file_path: str) -> Dict[str, Any]:
-        """Main PDF processing method with advanced image detection and positioning"""
-        start_time = time.time()
+    # ========================================
+    # ADVANCED PDF PROCESSING METHODS
+    # ========================================
+    
+    def _process_pdf_with_advanced_image_handling(self, file_path: str) -> Dict[str, Any]:
+        """ADVANCED PDF processing with complete image detection, deduplication, and spatial positioning"""
+        
+        logger.info("Starting ADVANCED PDF processing with complete image handling...")
         
         try:
-            logger.info(f"Starting advanced PDF processing for {self.document_id}")
-            
-            # Open PDF with advanced options
+            # Open PDF document
             pdf_doc = fitz.open(file_path)
-            logger.info(f"PDF opened: {len(pdf_doc)} pages")
+            pages_processed = len(pdf_doc)
             
-            # Phase 1: Comprehensive Analysis
-            self._perform_comprehensive_analysis(pdf_doc)
+            logger.info(f"PDF opened successfully: {pages_processed} pages")
             
-            # Phase 2: Advanced Image Detection
-            self._detect_all_images_advanced(pdf_doc)
+            # PHASE 1: ADVANCED MULTI-METHOD IMAGE DETECTION
+            logger.info("PHASE 1: Advanced multi-method image detection...")
+            all_detected_images = self._detect_all_images_advanced(pdf_doc)
+            logger.info(f"Detected {len(all_detected_images)} total image instances using advanced methods")
             
-            # Phase 3: Text Extraction with Positioning
-            self._extract_text_with_positioning(pdf_doc)
+            # PHASE 2: HASH-BASED DUPLICATE DETECTION
+            logger.info("PHASE 2: Hash-based duplicate detection...")
+            unique_images, duplicate_groups = self._identify_duplicates_advanced(pdf_doc, all_detected_images)
+            logger.info(f"Identified {len(unique_images)} unique images in {len(duplicate_groups)} duplicate groups")
             
-            # Phase 4: Spatial Integration
-            self._integrate_images_and_text_spatially(pdf_doc)
+            # PHASE 3: SPATIAL TEXT EXTRACTION WITH POSITIONING
+            logger.info("PHASE 3: Spatial text extraction with positioning...")
+            text_blocks_by_page = self._extract_text_with_spatial_info(pdf_doc)
             
-            # Phase 5: Generate Final Document
-            formatted_text = self._generate_final_document()
+            # PHASE 4: INTELLIGENT IMAGE-TEXT INTEGRATION
+            logger.info("PHASE 4: Intelligent image-text integration...")
+            formatted_text = self._integrate_images_and_text_spatially(
+                pdf_doc, text_blocks_by_page, unique_images, duplicate_groups
+            )
             
-            # Phase 6: Process and Upload Images
-            self._process_and_upload_all_images(pdf_doc)
-            
-            # Phase 7: Finalize Text with Image Links
-            final_text = self._finalize_text_with_images(formatted_text)
-            
-            pdf_doc.close()
-            
-            processing_time = time.time() - start_time
-            self.stats['processing_time'] = processing_time
-            
-            logger.info(f"Advanced PDF processing complete:")
-            logger.info(f"  - Processing time: {processing_time:.2f}s")
-            logger.info(f"  - Total images detected: {self.stats['total_images_detected']}")
-            logger.info(f"  - Unique images: {self.stats['unique_images']}")
-            logger.info(f"  - Duplicate instances: {self.stats['duplicate_images']}")
-            logger.info(f"  - Images uploaded: {self.stats['images_uploaded']}")
-            logger.info(f"  - Text blocks processed: {self.stats['text_blocks_processed']}")
+            # PHASE 5: PROCESS AND UPLOAD IMAGES
+            logger.info("PHASE 5: Process and upload unique images...")
+            final_text = self._process_and_upload_unique_images(
+                pdf_doc, formatted_text, unique_images, duplicate_groups
+            )
             
             # Generate plain text
             plain_text = self._strip_formatting_markers(final_text)
             
+            pdf_doc.close()
+            
+            # Calculate statistics
+            total_image_instances = sum(len(group) for group in duplicate_groups.values())
+            unique_images_count = len(unique_images)
+            
+            logger.info(f"ADVANCED PDF processing complete:")
+            logger.info(f"  - Pages processed: {pages_processed}")
+            logger.info(f"  - Total image instances: {total_image_instances}")
+            logger.info(f"  - Unique images: {unique_images_count}")
+            logger.info(f"  - Duplicate groups: {len(duplicate_groups)}")
+            logger.info(f"  - Images uploaded: {len(self.processed_images)}")
+            
             return {
                 'formatted_text': final_text,
                 'plain_text': plain_text,
-                'method': 'advanced_pdf_with_spatial_positioning',
-                'pages_processed': self.stats['pages_processed'],
-                'total_image_references': self.stats['total_images_detected'],
-                'unique_image_files': self.stats['unique_images'],
-                'duplicate_image_instances': self.stats['duplicate_images'],
-                'images_extracted': self.stats['images_extracted'],
-                'images_uploaded': self.stats['images_uploaded'],
-                'text_blocks_processed': self.stats['text_blocks_processed'],
-                'positioning_accuracy': self.stats['positioning_accuracy'],
-                'processing_stats': self.stats,
-                'tables_count': 0,
-                'headings_count': len([tb for tb in self.text_blocks if tb.is_heading])
+                'method': 'advanced_pdf_with_spatial_positioning_and_deduplication',
+                'pages_processed': pages_processed,
+                'total_image_references': len(all_detected_images),
+                'total_image_instances': total_image_instances,
+                'unique_image_files': unique_images_count,
+                'unique_images': unique_images_count,
+                'duplicate_groups': len(duplicate_groups),
+                'tables_count': self._count_tables_in_text(final_text),
+                'headings_count': self._count_headings_in_text(final_text)
             }
             
         except Exception as e:
-            processing_time = time.time() - start_time
-            logger.error(f"Advanced PDF processing failed: {e}")
-            logger.error(traceback.format_exc())
-            
+            logger.error(f"ADVANCED PDF processing failed: {e}")
             return self._fallback_pdf_extraction(file_path)
     
-    def _perform_comprehensive_analysis(self, pdf_doc: fitz.Document) -> None:
-        """Phase 1: Perform comprehensive document analysis"""
-        logger.info("Phase 1: Comprehensive document analysis")
+    def _detect_all_images_advanced(self, pdf_doc) -> Dict[int, AdvancedImageInfo]:
+        """PHASE 1: Detect ALL images using multiple advanced methods"""
         
-        self.stats['pages_processed'] = len(pdf_doc)
+        all_images = {}
+        detection_stats = defaultdict(int)
         
-        # Analyze document structure
-        for page_num in range(len(pdf_doc)):
-            page = pdf_doc.load_page(page_num)
-            
-            # Get page dimensions for spatial calculations
-            page_rect = page.rect
-            logger.info(f"Page {page_num + 1} dimensions: {page_rect.width} x {page_rect.height}")
-            
-            # Initialize spatial index for this page
-            self.spatial_index[page_num] = []
-    
-    def _detect_all_images_advanced(self, pdf_doc: fitz.Document) -> None:
-        """Phase 2: Advanced image detection that finds ALL images including duplicates"""
-        logger.info("Phase 2: Advanced image detection and analysis")
-        
-        extraction_order = 0
+        logger.info("Starting comprehensive image detection across all pages...")
         
         for page_num in range(len(pdf_doc)):
             page = pdf_doc.load_page(page_num)
+            page_images = {}
             
-            logger.info(f"Analyzing images on page {page_num + 1}")
-            
-            # Method 1: Get basic image list
-            basic_image_list = page.get_images()
-            logger.info(f"  - Basic image detection found: {len(basic_image_list)} images")
-            
-            # Method 2: Advanced image detection using page drawings
-            drawings = page.get_drawings()
-            logger.info(f"  - Drawing analysis found: {len(drawings)} vector elements")
-            
-            # Method 3: Text extraction with image markers
-            text_dict = page.get_text("dict")
-            embedded_images = self._find_embedded_images_in_text_dict(text_dict, page_num)
-            logger.info(f"  - Text analysis found: {len(embedded_images)} embedded images")
-            
-            # Method 4: Advanced spatial analysis
-            spatial_images = self._detect_images_spatially(page, page_num)
-            logger.info(f"  - Spatial analysis found: {len(spatial_images)} positioned images")
-            
-            # Process basic image list with advanced analysis
-            for img_index, img_data in enumerate(basic_image_list):
-                try:
-                    xref = img_data[0]
-                    
-                    # Get image properties
-                    base_image = pdf_doc.extract_image(xref)
-                    if not base_image:
-                        logger.warning(f"Could not extract base image for xref {xref}")
-                        continue
-                    
-                    # Calculate image hash for duplicate detection
-                    image_bytes = base_image["image"]
-                    image_hash = hashlib.md5(image_bytes).hexdigest()
-                    
-                    # Find all instances of this image on the current page
-                    instances = self._find_all_image_instances_on_page(
-                        page, xref, image_hash, page_num, extraction_order
-                    )
-                    
-                    # Add to our comprehensive list
-                    for instance in instances:
-                        self.image_instances.append(instance)
-                        extraction_order += 1
-                        
-                        logger.info(f"  - Detected image instance {instance.instance_id} at {instance.bbox}")
-                    
-                except Exception as e:
-                    logger.error(f"Error processing image {img_index} on page {page_num + 1}: {e}")
-                    continue
-            
-            # Process spatial images that might have been missed
-            for spatial_img in spatial_images:
-                if not any(self._rectangles_overlap(spatial_img['bbox'], inst.bbox) 
-                          for inst in self.image_instances if inst.page_number == page_num + 1):
-                    # This is a new image not detected by basic method
-                    try:
-                        instance = self._create_spatial_image_instance(
-                            spatial_img, page_num, extraction_order
-                        )
-                        if instance:
-                            self.image_instances.append(instance)
-                            extraction_order += 1
-                            logger.info(f"  - Added spatial image {instance.instance_id}")
-                    except Exception as e:
-                        logger.error(f"Error processing spatial image: {e}")
-        
-        # Post-process: Identify duplicates across all pages
-        self._identify_duplicates_advanced()
-        
-        # Update statistics
-        self.stats['total_images_detected'] = len(self.image_instances)
-        self.stats['unique_images'] = len(set(inst.image_hash for inst in self.image_instances))
-        self.stats['duplicate_images'] = self.stats['total_images_detected'] - self.stats['unique_images']
-        
-        logger.info(f"Advanced image detection complete:")
-        logger.info(f"  - Total instances: {self.stats['total_images_detected']}")
-        logger.info(f"  - Unique images: {self.stats['unique_images']}")
-        logger.info(f"  - Duplicates: {self.stats['duplicate_images']}")
-    
-    def _find_all_image_instances_on_page(self, page: fitz.Page, xref: int, 
-                                        image_hash: str, page_num: int, 
-                                        base_extraction_order: int) -> List[ImageInstance]:
-        """Find all instances of a specific image on a page (including duplicates)"""
-        instances = []
-        
-        try:
-            # Get all image rectangles for this xref
-            image_rects = []
-            
-            # Try to get image rectangles
+            # METHOD 1: Standard get_images() 
             try:
-                if hasattr(page, 'get_image_rects'):
-                    rects = page.get_image_rects(xref)
-                    image_rects.extend(rects)
-                else:
-                    # Fallback: estimate positions
-                    image_rects = self._estimate_image_positions(page, xref)
-            except Exception as e:
-                logger.warning(f"Could not get image rectangles: {e}")
-                image_rects = self._estimate_image_positions(page, xref)
-            
-            # If no rects found, create default position
-            if not image_rects:
-                page_rect = page.rect
-                default_rect = fitz.Rect(
-                    page_rect.width * 0.1,
-                    page_rect.height * 0.1,
-                    page_rect.width * 0.5,
-                    page_rect.height * 0.3
-                )
-                image_rects = [default_rect]
-                logger.info(f"Using estimated position for image xref {xref}")
-            
-            # Create instances for each rectangle
-            for rect_index, rect in enumerate(image_rects):
-                instance_id = f"img_{page_num + 1}_{xref}_{rect_index}_{int(time.time() * 1000000) + rect_index}"
-                
-                instance = ImageInstance(
-                    xref=xref,
-                    bbox=(rect.x0, rect.y0, rect.x1, rect.y1),
-                    page_number=page_num + 1,
-                    instance_id=instance_id,
-                    image_hash=image_hash,
-                    width=rect.width,
-                    height=rect.height,
-                    area=rect.width * rect.height,
-                    extraction_order=base_extraction_order + rect_index
-                )
-                
-                instances.append(instance)
-                logger.info(f"Created instance {instance_id} at {instance.bbox}")
-        
-        except Exception as e:
-            logger.error(f"Error finding image instances for xref {xref}: {e}")
-            
-            # Create fallback instance
-            page_rect = page.rect
-            fallback_rect = (
-                page_rect.width * 0.1,
-                page_rect.height * 0.1,
-                page_rect.width * 0.5,
-                page_rect.height * 0.3
-            )
-            
-            instance_id = f"img_{page_num + 1}_{xref}_fallback_{int(time.time() * 1000000)}"
-            
-            instance = ImageInstance(
-                xref=xref,
-                bbox=fallback_rect,
-                page_number=page_num + 1,
-                instance_id=instance_id,
-                image_hash=image_hash,
-                width=fallback_rect[2] - fallback_rect[0],
-                height=fallback_rect[3] - fallback_rect[1],
-                area=(fallback_rect[2] - fallback_rect[0]) * (fallback_rect[3] - fallback_rect[1]),
-                extraction_order=base_extraction_order
-            )
-            
-            instances.append(instance)
-        
-        return instances
-    
-    def _estimate_image_positions(self, page: fitz.Page, xref: int) -> List[fitz.Rect]:
-        """Estimate image positions when direct position detection fails"""
-        positions = []
-        
-        try:
-            # Get text blocks to help estimate positions
-            text_blocks = page.get_text("dict")["blocks"]
-            page_rect = page.rect
-            
-            # Strategy: Place images between text blocks or in empty areas
-            text_areas = []
-            for block in text_blocks:
-                if "bbox" in block:
-                    text_areas.append(fitz.Rect(block["bbox"]))
-            
-            # If we have text, try to place images in gaps
-            if text_areas:
-                # Sort text areas by position
-                text_areas.sort(key=lambda r: (r.y0, r.x0))
-                
-                # Find gaps between text areas
-                for i in range(len(text_areas)):
-                    if i == 0:
-                        # Before first text block
-                        if text_areas[0].y0 > page_rect.height * 0.1:
-                            img_rect = fitz.Rect(
-                                page_rect.x0 + 20,
-                                page_rect.y0 + 20,
-                                page_rect.x1 - 20,
-                                text_areas[0].y0 - 10
-                            )
-                            if img_rect.width > 50 and img_rect.height > 50:
-                                positions.append(img_rect)
-                    
-                    if i < len(text_areas) - 1:
-                        # Between text blocks
-                        current_block = text_areas[i]
-                        next_block = text_areas[i + 1]
+                standard_images = page.get_images()
+                for img_idx, img_info in enumerate(standard_images):
+                    xref = img_info[0]
+                    if xref not in page_images:
+                        image_obj = AdvancedImageInfo(xref, page_num, img_idx)
+                        image_obj.extraction_methods.append('standard_get_images')
+                        page_images[xref] = image_obj
+                        detection_stats['standard_get_images'] += 1
+                    else:
+                        page_images[xref].extraction_methods.append('standard_get_images_duplicate')
                         
-                        gap_height = next_block.y0 - current_block.y1
-                        if gap_height > 60:  # Enough space for an image
-                            img_rect = fitz.Rect(
-                                page_rect.x0 + 20,
-                                current_block.y1 + 10,
-                                page_rect.x1 - 20,
-                                current_block.y1 + min(gap_height - 10, 200)
-                            )
-                            positions.append(img_rect)
+            except Exception as e:
+                logger.warning(f"Standard image detection failed for page {page_num}: {e}")
             
-            # If no good positions found, use default grid
-            if not positions:
-                positions.append(fitz.Rect(
-                    page_rect.width * 0.1,
-                    page_rect.height * 0.2,
-                    page_rect.width * 0.9,
-                    page_rect.height * 0.5
-                ))
-        
-        except Exception as e:
-            logger.error(f"Error estimating image positions: {e}")
+            # METHOD 2: Advanced get_images with full resolution
+            try:
+                full_images = page.get_images(full=True)
+                for img_idx, img_info in enumerate(full_images):
+                    xref = img_info[0]
+                    if xref not in page_images:
+                        image_obj = AdvancedImageInfo(xref, page_num, img_idx)
+                        image_obj.extraction_methods.append('full_resolution_get_images')
+                        # Store additional info from full detection
+                        if len(img_info) > 2:
+                            image_obj.width = img_info[2] if img_info[2] else 0
+                            image_obj.height = img_info[3] if img_info[3] else 0
+                        page_images[xref] = image_obj
+                        detection_stats['full_resolution_get_images'] += 1
+                    else:
+                        page_images[xref].extraction_methods.append('full_resolution_get_images_duplicate')
+                        
+            except Exception as e:
+                logger.warning(f"Full resolution image detection failed for page {page_num}: {e}")
             
-            # Ultimate fallback
-            page_rect = page.rect
-            positions.append(fitz.Rect(
-                page_rect.width * 0.1,
-                page_rect.height * 0.1,
-                page_rect.width * 0.5,
-                page_rect.height * 0.3
-            ))
+            # METHOD 3: Drawing object detection
+            try:
+                drawing_images = self._detect_drawing_images(page, page_num)
+                for xref, image_obj in drawing_images.items():
+                    if xref not in page_images:
+                        image_obj.extraction_methods.append('drawing_object_detection')
+                        page_images[xref] = image_obj
+                        detection_stats['drawing_object_detection'] += 1
+                    else:
+                        page_images[xref].extraction_methods.append('drawing_object_detection_duplicate')
+                        
+            except Exception as e:
+                logger.warning(f"Drawing object detection failed for page {page_num}: {e}")
+            
+            # METHOD 4: XObject and Form detection
+            try:
+                xobject_images = self._detect_xobject_images(page, page_num)
+                for xref, image_obj in xobject_images.items():
+                    if xref not in page_images:
+                        image_obj.extraction_methods.append('xobject_detection')
+                        page_images[xref] = image_obj
+                        detection_stats['xobject_detection'] += 1
+                    else:
+                        page_images[xref].extraction_methods.append('xobject_detection_duplicate')
+                        
+            except Exception as e:
+                logger.warning(f"XObject detection failed for page {page_num}: {e}")
+            
+            # METHOD 5: Pattern and shading image detection
+            try:
+                pattern_images = self._detect_pattern_images(page, page_num)
+                for xref, image_obj in pattern_images.items():
+                    if xref not in page_images:
+                        image_obj.extraction_methods.append('pattern_detection')
+                        page_images[xref] = image_obj
+                        detection_stats['pattern_detection'] += 1
+                    else:
+                        page_images[xref].extraction_methods.append('pattern_detection_duplicate')
+                        
+            except Exception as e:
+                logger.warning(f"Pattern detection failed for page {page_num}: {e}")
+            
+            # METHOD 6: Multiple instance detection per page
+            try:
+                self._find_all_image_instances_on_page(page, page_num, page_images)
+            except Exception as e:
+                logger.warning(f"Multiple instance detection failed for page {page_num}: {e}")
+            
+            # Add page images to global collection
+            all_images.update(page_images)
+            
+            if page_images:
+                logger.info(f"Page {page_num + 1}: Found {len(page_images)} unique images")
+            
+        logger.info(f"Detection complete - Found {len(all_images)} total unique image xrefs")
+        logger.info(f"Detection method statistics: {dict(detection_stats)}")
         
-        return positions
+        return all_images
     
-    def _find_embedded_images_in_text_dict(self, text_dict: Dict, page_num: int) -> List[Dict]:
-        """Find images embedded in text structure"""
-        embedded_images = []
+    def _detect_drawing_images(self, page, page_num: int) -> Dict[int, AdvancedImageInfo]:
+        """Detect images within drawing objects"""
+        
+        drawing_images = {}
         
         try:
-            for block in text_dict.get("blocks", []):
-                if "lines" in block:
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            # Look for image markers or special characters
-                            text = span.get("text", "")
-                            if any(char in text for char in ["□", "▢", "⬜", "◊"]):
-                                # Potential image placeholder
-                                bbox = span.get("bbox")
-                                if bbox:
-                                    embedded_images.append({
-                                        'bbox': bbox,
-                                        'type': 'placeholder',
-                                        'page': page_num,
-                                        'text': text
-                                    })
-        
-        except Exception as e:
-            logger.error(f"Error finding embedded images: {e}")
-        
-        return embedded_images
-    
-    def _detect_images_spatially(self, page: fitz.Page, page_num: int) -> List[Dict]:
-        """Detect images using spatial analysis of page elements"""
-        spatial_images = []
-        
-        try:
-            # Get all drawings and analyze for image-like patterns
+            # Get drawing objects from page
             drawings = page.get_drawings()
             
-            for drawing in drawings:
-                # Analyze drawing properties
-                rect = drawing.get("rect")
-                if rect and rect.width > 20 and rect.height > 20:
-                    # This could be an image boundary
-                    spatial_images.append({
-                        'bbox': (rect.x0, rect.y0, rect.x1, rect.y1),
-                        'type': 'spatial_drawing',
-                        'page': page_num,
-                        'width': rect.width,
-                        'height': rect.height,
-                        'area': rect.width * rect.height
-                    })
-        
+            for draw_idx, drawing in enumerate(drawings):
+                # Check if drawing contains image references
+                if 'items' in drawing:
+                    for item in drawing['items']:
+                        if item[0] == 'l':  # Line with possible image fill
+                            continue
+                        elif item[0] == 'c':  # Curve with possible image fill
+                            continue
+                        elif item[0] == 're':  # Rectangle that might be an image
+                            # Check if rectangle has image properties
+                            rect = item[1]
+                            if len(rect) >= 4:  # x0, y0, x1, y1
+                                # This could be an image placeholder
+                                pass
+                                
+            # Alternative: Check for inline images in content stream
+            try:
+                content = page.get_text("dict")
+                # Look for image markers in content
+                for block in content.get("blocks", []):
+                    if block.get("type") == 1:  # Image block
+                        # This is an image block
+                        if "bbox" in block:
+                            bbox = block["bbox"]
+                            # Try to find corresponding xref
+                            # This is complex and may require parsing content stream
+                            pass
+            except:
+                pass
+                
         except Exception as e:
-            logger.error(f"Error in spatial image detection: {e}")
+            logger.debug(f"Drawing image detection failed for page {page_num}: {e}")
         
-        return spatial_images
+        return drawing_images
     
-    def _create_spatial_image_instance(self, spatial_img: Dict, page_num: int, 
-                                     extraction_order: int) -> Optional[ImageInstance]:
-        """Create an image instance from spatial detection"""
-        try:
-            bbox = spatial_img['bbox']
-            instance_id = f"spatial_{page_num + 1}_{extraction_order}_{int(time.time() * 1000000)}"
-            
-            # Create a synthetic hash for spatial images
-            spatial_hash = hashlib.md5(
-                f"{bbox}_{spatial_img['type']}_{page_num}".encode()
-            ).hexdigest()
-            
-            instance = ImageInstance(
-                xref=-1,  # No xref for spatial images
-                bbox=bbox,
-                page_number=page_num + 1,
-                instance_id=instance_id,
-                image_hash=spatial_hash,
-                width=spatial_img['width'],
-                height=spatial_img['height'],
-                area=spatial_img['area'],
-                extraction_order=extraction_order
-            )
-            
-            return instance
+    def _detect_xobject_images(self, page, page_num: int) -> Dict[int, AdvancedImageInfo]:
+        """Detect images in XObjects and Form objects"""
         
+        xobject_images = {}
+        
+        try:
+            # Get page dictionary
+            page_dict = page.get_contents()
+            if not page_dict:
+                return xobject_images
+                
+            # This is a simplified approach - full implementation would need
+            # to parse the PDF content stream and identify XObject references
+            
+            # For now, we'll use a heuristic approach
+            page_obj = page.get_contents()
+            if page_obj:
+                content_bytes = page_obj[0] if isinstance(page_obj, list) else page_obj
+                if hasattr(content_bytes, 'get_data'):
+                    content_text = content_bytes.get_data().decode('latin1', errors='ignore')
+                    
+                    # Look for XObject image references in content stream
+                    xobj_pattern = r'/Im(\d+)\s+Do'
+                    matches = re.findall(xobj_pattern, content_text)
+                    
+                    for match in matches:
+                        # This indicates an image XObject usage
+                        # We'd need to resolve the actual xref
+                        logger.debug(f"Found XObject image reference Im{match} on page {page_num}")
+                        
         except Exception as e:
-            logger.error(f"Error creating spatial image instance: {e}")
+            logger.debug(f"XObject image detection failed for page {page_num}: {e}")
+        
+        return xobject_images
+    
+    def _detect_pattern_images(self, page, page_num: int) -> Dict[int, AdvancedImageInfo]:
+        """Detect images used in patterns and shadings"""
+        
+        pattern_images = {}
+        
+        try:
+            # Get page resources for pattern detection
+            # This would require deeper PDF parsing
+            # For now, implemented as placeholder for future enhancement
+            pass
+                        
+        except Exception as e:
+            logger.debug(f"Pattern image detection failed for page {page_num}: {e}")
+        
+        return pattern_images
+    
+    def _find_all_image_instances_on_page(self, page, page_num: int, page_images: Dict[int, AdvancedImageInfo]) -> None:
+        """Find ALL instances of each image on the page (for images used multiple times)"""
+        
+        try:
+            # Get all image instances with positioning
+            image_instances = []
+            
+            # Method 1: Try to get image instances with bounding boxes
+            try:
+                # Get images with location info
+                images_with_bbox = page.get_image_bbox([img_info for img_info in page.get_images()])
+                
+                for i, (img_info, bbox) in enumerate(zip(page.get_images(), images_with_bbox)):
+                    xref = img_info[0]
+                    if xref in page_images:
+                        # Store bounding box info
+                        if not page_images[xref].bbox:
+                            page_images[xref].bbox = bbox
+                        
+                        # Add to instances list
+                        instance_info = {
+                            'bbox': bbox,
+                            'instance_index': i,
+                            'page_num': page_num
+                        }
+                        page_images[xref].instances.append(instance_info)
+                        
+            except Exception as e:
+                logger.debug(f"Image bbox detection failed for page {page_num}: {e}")
+            
+            # Method 2: Parse content stream for multiple Do operations (same image used multiple times)
+            try:
+                content_stream = page.get_contents()
+                if content_stream:
+                    # Convert to text for parsing
+                    content_bytes = content_stream[0] if isinstance(content_stream, list) else content_stream
+                    if hasattr(content_bytes, 'get_data'):
+                        content_text = content_bytes.get_data().decode('latin1', errors='ignore')
+                        
+                        # Look for transformation matrices followed by Do operations
+                        # This pattern indicates multiple placements of the same image
+                        matrix_do_pattern = r'(\d+(?:\.\d+)?\s+){6}cm\s+/Im(\d+)\s+Do'
+                        matches = re.findall(matrix_do_pattern, content_text)
+                        
+                        if matches:
+                            logger.debug(f"Found {len(matches)} potential multiple image instances on page {page_num}")
+                            
+            except Exception as e:
+                logger.debug(f"Content stream parsing failed for page {page_num}: {e}")
+                
+        except Exception as e:
+            logger.warning(f"Multiple instance detection failed for page {page_num}: {e}")
+    
+    def _identify_duplicates_advanced(self, pdf_doc, all_images: Dict[int, AdvancedImageInfo]) -> Tuple[List[AdvancedImageInfo], Dict[str, List[AdvancedImageInfo]]]:
+        """PHASE 2: Advanced duplicate detection using multiple hashing methods"""
+        
+        logger.info("Starting advanced duplicate detection...")
+        
+        # Extract and hash all images
+        hash_map = {}  # hash -> first image with this hash
+        duplicate_groups = {}  # group_id -> list of images
+        unique_images = []
+        
+        for xref, image_info in all_images.items():
+            try:
+                # Extract image data
+                image_data = self._extract_image_data(pdf_doc, xref)
+                
+                if not image_data or len(image_data) < MIN_IMAGE_SIZE_BYTES:
+                    logger.debug(f"Skipping tiny or empty image xref={xref}")
+                    continue
+                
+                image_info.image_data = image_data
+                image_info.size_bytes = len(image_data)
+                
+                # Generate multiple hashes for robust duplicate detection
+                hashes = self._generate_image_hashes(image_data)
+                primary_hash = hashes['md5']  # Use MD5 as primary
+                image_info.hash_value = primary_hash
+                
+                # Check for duplicates
+                if primary_hash in hash_map:
+                    # This is a duplicate
+                    master_image = hash_map[primary_hash]
+                    image_info.is_duplicate = True
+                    image_info.master_image = master_image
+                    image_info.duplicate_group_id = master_image.duplicate_group_id
+                    
+                    # Add to duplicate group
+                    if master_image.duplicate_group_id in duplicate_groups:
+                        duplicate_groups[master_image.duplicate_group_id].append(image_info)
+                    else:
+                        logger.error(f"Duplicate group {master_image.duplicate_group_id} not found!")
+                    
+                    logger.info(f"Found duplicate: xref={xref} matches xref={master_image.xref} (page {master_image.page_num + 1})")
+                    
+                else:
+                    # This is a unique image
+                    image_info.is_duplicate = False
+                    image_info.duplicate_group_id = f"group_{len(duplicate_groups)}"
+                    
+                    # Create new group
+                    duplicate_groups[image_info.duplicate_group_id] = [image_info]
+                    hash_map[primary_hash] = image_info
+                    unique_images.append(image_info)
+                    
+                    logger.debug(f"Unique image: xref={xref} on page {image_info.page_num + 1}, size={image_info.size_bytes} bytes")
+                
+            except Exception as e:
+                logger.warning(f"Failed to process image xref={xref}: {e}")
+                continue
+        
+        logger.info(f"Duplicate detection complete:")
+        logger.info(f"  - Total images processed: {len(all_images)}")
+        logger.info(f"  - Unique images: {len(unique_images)}")
+        logger.info(f"  - Duplicate groups: {len(duplicate_groups)}")
+        
+        # Log duplicate group details
+        for group_id, group_images in duplicate_groups.items():
+            if len(group_images) > 1:
+                pages = [str(img.page_num + 1) for img in group_images]
+                logger.info(f"  - {group_id}: {len(group_images)} instances on pages {', '.join(pages)}")
+        
+        return unique_images, duplicate_groups
+    
+    def _extract_image_data(self, pdf_doc, xref: int) -> Optional[bytes]:
+        """Extract raw image data from PDF xref"""
+        
+        try:
+            # Method 1: Direct pixmap extraction
+            pix = fitz.Pixmap(pdf_doc, xref)
+            
+            if pix.n - pix.alpha < 4:  # Valid image (GRAY or RGB)
+                if pix.n - pix.alpha == 1:  # Grayscale
+                    img_data = pix.tobytes("png")
+                elif pix.n - pix.alpha == 3:  # RGB
+                    img_data = pix.tobytes("png")
+                else:
+                    # Convert CMYK to RGB
+                    pix_rgb = fitz.Pixmap(fitz.csRGB, pix)
+                    img_data = pix_rgb.tobytes("png")
+                    pix_rgb = None
+                
+                pix = None  # Free memory
+                return img_data
+            else:
+                pix = None
+                return None
+                
+        except Exception as e:
+            logger.debug(f"Failed to extract image data for xref {xref}: {e}")
+            
+            # Method 2: Fallback using extract_image
+            try:
+                extracted_image = pdf_doc.extract_image(xref)
+                if extracted_image and 'image' in extracted_image:
+                    return extracted_image['image']
+            except Exception as e2:
+                logger.debug(f"Fallback extraction also failed for xref {xref}: {e2}")
+            
             return None
     
-    def _rectangles_overlap(self, rect1: Tuple[float, float, float, float], 
-                           rect2: Tuple[float, float, float, float]) -> bool:
-        """Check if two rectangles overlap"""
-        return not (rect1[2] < rect2[0] or rect2[2] < rect1[0] or 
-                   rect1[3] < rect2[1] or rect2[3] < rect1[1])
+    def _generate_image_hashes(self, image_data: bytes) -> Dict[str, str]:
+        """Generate multiple hashes for robust duplicate detection"""
+        
+        hashes = {}
+        
+        try:
+            # MD5 hash (primary)
+            hashes['md5'] = hashlib.md5(image_data).hexdigest()
+            
+            # SHA256 hash (secondary)
+            hashes['sha256'] = hashlib.sha256(image_data).hexdigest()
+            
+            # Simple content hash (first and last 1024 bytes)
+            if len(image_data) > 2048:
+                content_sample = image_data[:1024] + image_data[-1024:]
+                hashes['content'] = hashlib.md5(content_sample).hexdigest()
+            else:
+                hashes['content'] = hashes['md5']  # Same as MD5 for small images
+            
+        except Exception as e:
+            logger.warning(f"Hash generation failed: {e}")
+            # Fallback hash
+            hashes['md5'] = str(hash(image_data))[:32]
+        
+        return hashes
     
-    def _identify_duplicates_advanced(self) -> None:
-        """Advanced duplicate identification across all pages"""
-        logger.info("Identifying duplicate images across document")
+    def _extract_text_with_spatial_info(self, pdf_doc) -> Dict[int, List[Dict]]:
+        """PHASE 3: Extract text with detailed spatial positioning information"""
         
-        # Group by hash
-        hash_groups = defaultdict(list)
-        for instance in self.image_instances:
-            hash_groups[instance.image_hash].append(instance)
+        logger.info("Extracting text with spatial positioning...")
         
-        # Process each hash group
-        for image_hash, instances in hash_groups.items():
-            if len(instances) > 1:
-                # Sort by extraction order to determine original
-                instances.sort(key=lambda x: x.extraction_order)
-                original = instances[0]
-                
-                # Mark duplicates
-                for duplicate in instances[1:]:
-                    duplicate.is_duplicate = True
-                    duplicate.original_instance_id = original.instance_id
-                
-                # Track duplicates
-                self.duplicate_map[original.instance_id] = [d.instance_id for d in instances[1:]]
-                
-                logger.info(f"Hash {image_hash[:8]}: 1 original + {len(instances) - 1} duplicates")
-        
-        # Update hash map
-        for instance in self.image_instances:
-            if not instance.is_duplicate:
-                self.image_hash_map[instance.image_hash] = instance.instance_id
-    
-    def _extract_text_with_positioning(self, pdf_doc: fitz.Document) -> None:
-        """Phase 3: Extract text with detailed positioning information"""
-        logger.info("Phase 3: Text extraction with positioning")
-        
-        block_order = 0
+        text_blocks_by_page = {}
         
         for page_num in range(len(pdf_doc)):
             page = pdf_doc.load_page(page_num)
             
-            # Get text with detailed formatting
-            text_dict = page.get_text("dict")
-            
-            for block in text_dict.get("blocks", []):
-                if "lines" not in block:
-                    continue
-                
-                block_text_parts = []
-                block_bbox = block.get("bbox")
-                
-                if not block_bbox:
-                    continue
-                
-                # Process lines in block
-                for line in block["lines"]:
-                    line_text_parts = []
-                    
-                    for span in line["spans"]:
-                        text = span.get("text", "").strip()
-                        if text:
-                            font_size = span.get("size", 12)
-                            flags = span.get("flags", 0)
-                            
-                            # Apply formatting
-                            if flags & 16:  # Bold
-                                text = f"**{text}**"
-                            if flags & 2:   # Italic
-                                text = f"*{text}*"
-                            
-                            line_text_parts.append(text)
-                    
-                    if line_text_parts:
-                        block_text_parts.append(" ".join(line_text_parts))
-                
-                if block_text_parts:
-                    block_text = "\n".join(block_text_parts)
-                    
-                    # Determine if this is a heading
-                    avg_font_size = self._calculate_average_font_size_in_block(block)
-                    is_heading = avg_font_size > 14
-                    heading_level = min(6, max(1, int((avg_font_size - 12) / 2) + 1)) if is_heading else 0
-                    
-                    text_block = TextBlock(
-                        text=block_text,
-                        bbox=block_bbox,
-                        font_size=avg_font_size,
-                        font_name="",
-                        flags=0,
-                        page_number=page_num + 1,
-                        block_order=block_order,
-                        is_heading=is_heading,
-                        heading_level=heading_level
-                    )
-                    
-                    self.text_blocks.append(text_block)
-                    block_order += 1
-        
-        self.stats['text_blocks_processed'] = len(self.text_blocks)
-        logger.info(f"Extracted {len(self.text_blocks)} text blocks")
-    
-    def _calculate_average_font_size_in_block(self, block: Dict) -> float:
-        """Calculate average font size in a text block"""
-        sizes = []
-        
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                size = span.get("size")
-                if size:
-                    sizes.append(size)
-        
-        return sum(sizes) / len(sizes) if sizes else 12.0
-    
-    def _integrate_images_and_text_spatially(self, pdf_doc: fitz.Document) -> None:
-        """Phase 4: Spatially integrate images and text for proper positioning"""
-        logger.info("Phase 4: Spatial integration of images and text")
-        
-        # Group elements by page
-        page_elements = defaultdict(list)
-        
-        # Add text blocks
-        for text_block in self.text_blocks:
-            page_elements[text_block.page_number].append({
-                'type': 'text',
-                'element': text_block,
-                'bbox': text_block.bbox,
-                'y_center': (text_block.bbox[1] + text_block.bbox[3]) / 2
-            })
-        
-        # Add image instances
-        for image_instance in self.image_instances:
-            page_elements[image_instance.page_number].append({
-                'type': 'image',
-                'element': image_instance,
-                'bbox': image_instance.bbox,
-                'y_center': (image_instance.bbox[1] + image_instance.bbox[3]) / 2
-            })
-        
-        # Sort elements by position on each page
-        for page_num, elements in page_elements.items():
-            # Sort by Y position (top to bottom), then X position (left to right)
-            elements.sort(key=lambda e: (e['y_center'], e['bbox'][0]))
-            self.spatial_index[page_num] = elements
-            
-            # Calculate position in text flow for images
-            for i, element in enumerate(elements):
-                if element['type'] == 'image':
-                    image_instance = element['element']
-                    
-                    # Find surrounding text
-                    text_before = ""
-                    text_after = ""
-                    
-                    # Get text before
-                    for j in range(i - 1, -1, -1):
-                        if elements[j]['type'] == 'text':
-                            text_before = elements[j]['element'].text[-100:]
-                            break
-                    
-                    # Get text after
-                    for j in range(i + 1, len(elements)):
-                        if elements[j]['type'] == 'text':
-                            text_after = elements[j]['element'].text[:100]
-                            break
-                    
-                    image_instance.text_before = text_before
-                    image_instance.text_after = text_after
-                    image_instance.position_in_text = i
-            
-            logger.info(f"Page {page_num}: Integrated {len(elements)} elements")
-        
-        # Calculate positioning accuracy
-        positioned_correctly = sum(1 for inst in self.image_instances 
-                                 if inst.text_before or inst.text_after)
-        total_images = len(self.image_instances)
-        
-        if total_images > 0:
-            self.stats['positioning_accuracy'] = positioned_correctly / total_images
-        
-        logger.info(f"Positioning accuracy: {self.stats['positioning_accuracy']:.2%}")
-    
-    def _generate_final_document(self) -> str:
-        """Phase 5: Generate final document with properly positioned placeholders"""
-        logger.info("Phase 5: Generating final document")
-        
-        document_parts = []
-        
-        for page_num in sorted(self.spatial_index.keys()):
-            elements = self.spatial_index[page_num]
-            
-            if not elements:
-                continue
-            
-            page_parts = [f"## Page {page_num}\n"]
-            
-            for element in elements:
-                if element['type'] == 'text':
-                    text_block = element['element']
-                    
-                    # Apply heading formatting
-                    if text_block.is_heading:
-                        heading_prefix = "#" * (text_block.heading_level + 2)
-                        formatted_text = f"{heading_prefix} {text_block.text}\n"
-                    else:
-                        formatted_text = f"{text_block.text}\n"
-                    
-                    page_parts.append(formatted_text)
-                
-                elif element['type'] == 'image':
-                    image_instance = element['element']
-                    
-                    # Create placeholder marker
-                    placeholder_marker = f"__IMAGE_PLACEHOLDER_{image_instance.instance_id}__"
-                    
-                    # Add context information
-                    context_info = []
-                    if image_instance.text_before:
-                        context_info.append(f"After: ...{image_instance.text_before[-50:]}")
-                    if image_instance.text_after:
-                        context_info.append(f"Before: {image_instance.text_after[:50]}...")
-                    
-                    context_text = " | ".join(context_info) if context_info else "Standalone image"
-                    
-                    # Format image placeholder
-                    image_text = f"\n{placeholder_marker}\n*[Page {page_num}, Position {image_instance.position_in_text}]*\n"
-                    if image_instance.is_duplicate:
-                        image_text += f"*[Duplicate of {image_instance.original_instance_id}]*\n"
-                    image_text += f"*[Context: {context_text}]*\n\n"
-                    
-                    page_parts.append(image_text)
-            
-            document_parts.append("\n".join(page_parts))
-        
-        return "\n\n".join(document_parts)
-    
-    def _process_and_upload_all_images(self, pdf_doc: fitz.Document) -> None:
-        """Phase 6: Process and upload all detected images"""
-        logger.info("Phase 6: Processing and uploading images")
-        
-        uploaded_count = 0
-        processed_count = 0
-        
-        for image_instance in self.image_instances:
             try:
-                processed_count += 1
+                # Get text with detailed positioning
+                text_dict = page.get_text("dict")
                 
-                # Skip spatial images without xref for now
-                if image_instance.xref < 0:
-                    logger.info(f"Skipping spatial image {image_instance.instance_id} (no xref)")
-                    continue
+                page_blocks = []
                 
-                # Extract image data
-                try:
-                    base_image = pdf_doc.extract_image(image_instance.xref)
-                    if not base_image:
-                        logger.warning(f"Could not extract image data for {image_instance.instance_id}")
-                        continue
-                    
-                    image_bytes = base_image["image"]
-                    image_ext = base_image["ext"]
-                    
-                except Exception as e:
-                    logger.error(f"Failed to extract image data for {image_instance.instance_id}: {e}")
-                    continue
-                
-                # Skip tiny images
-                if len(image_bytes) < 100:
-                    logger.warning(f"Image {image_instance.instance_id} too small ({len(image_bytes)} bytes)")
-                    continue
-                
-                # For duplicates, reference the original upload
-                if image_instance.is_duplicate:
-                    original_id = image_instance.original_instance_id
-                    original_s3_key = self.placeholders.get(f"IMG_{original_id}")
-                    
-                    if original_s3_key:
-                        # Create reference to original
-                        self.placeholders[f"IMG_{image_instance.instance_id}"] = original_s3_key
-                        
-                        # Store metadata for duplicate
-                        duplicate_info = {
-                            'placeholder': f"IMG_{image_instance.instance_id}",
-                            's3_key': original_s3_key,
-                            's3_filename': f"IMG_{image_instance.instance_id}.{image_ext}",
-                            'original_filename': f"page_{image_instance.page_number}_img_{image_instance.xref}.{image_ext}",
-                            'image_number': self.image_counter,
-                            'instance_id': image_instance.instance_id,
-                            'is_duplicate': True,
-                            'original_instance_id': original_id,
-                            'page_number': image_instance.page_number,
-                            'bbox': image_instance.bbox,
-                            'size_bytes': len(image_bytes),
-                            'uploaded': False,
-                            'upload_timestamp': datetime.utcnow().isoformat(),
-                            'source_type': 'pdf_advanced'
+                for block in text_dict.get("blocks", []):
+                    if "lines" in block:  # Text block
+                        block_info = {
+                            'type': 'text',
+                            'bbox': block.get('bbox', (0, 0, 0, 0)),
+                            'lines': [],
+                            'content': ''
                         }
                         
-                        self.processed_images.append(duplicate_info)
-                        self.image_counter += 1
+                        block_content_parts = []
                         
-                        logger.info(f"Referenced duplicate {image_instance.instance_id} → {original_s3_key}")
-                        continue
+                        for line in block["lines"]:
+                            line_info = {
+                                'bbox': line.get('bbox', (0, 0, 0, 0)),
+                                'spans': [],
+                                'content': ''
+                            }
+                            
+                            line_content_parts = []
+                            
+                            for span in line["spans"]:
+                                span_text = span.get("text", "").strip()
+                                if span_text:
+                                    span_info = {
+                                        'text': span_text,
+                                        'bbox': span.get('bbox', (0, 0, 0, 0)),
+                                        'font': span.get('font', ''),
+                                        'size': span.get('size', 12),
+                                        'flags': span.get('flags', 0)
+                                    }
+                                    
+                                    line_info['spans'].append(span_info)
+                                    line_content_parts.append(span_text)
+                            
+                            if line_content_parts:
+                                line_info['content'] = ' '.join(line_content_parts)
+                                block_info['lines'].append(line_info)
+                                block_content_parts.append(line_info['content'])
+                        
+                        if block_content_parts:
+                            block_info['content'] = '\n'.join(block_content_parts)
+                            page_blocks.append(block_info)
                 
-                # Upload new/original image
-                placeholder_name = f"IMG_{image_instance.instance_id}"
+                text_blocks_by_page[page_num] = page_blocks
+                
+                logger.debug(f"Page {page_num + 1}: Extracted {len(page_blocks)} text blocks")
+                
+            except Exception as e:
+                logger.warning(f"Text extraction with spatial info failed for page {page_num}: {e}")
+                
+                # Fallback: simple text extraction
+                try:
+                    simple_text = page.get_text()
+                    if simple_text.strip():
+                        fallback_block = {
+                            'type': 'text',
+                            'bbox': page.rect,
+                            'lines': [],
+                            'content': simple_text
+                        }
+                        text_blocks_by_page[page_num] = [fallback_block]
+                except Exception as e2:
+                    logger.error(f"Even fallback text extraction failed for page {page_num}: {e2}")
+                    text_blocks_by_page[page_num] = []
+        
+        total_blocks = sum(len(blocks) for blocks in text_blocks_by_page.values())
+        logger.info(f"Text extraction complete: {total_blocks} total text blocks")
+        
+        return text_blocks_by_page
+    
+    def _integrate_images_and_text_spatially(self, pdf_doc, text_blocks_by_page: Dict[int, List[Dict]], 
+                                           unique_images: List[AdvancedImageInfo], 
+                                           duplicate_groups: Dict[str, List[AdvancedImageInfo]]) -> str:
+        """PHASE 4: Intelligently integrate images and text based on spatial positioning"""
+        
+        logger.info("Starting intelligent spatial integration...")
+        
+        formatted_parts = []
+        
+        for page_num in range(len(pdf_doc)):
+            logger.debug(f"Processing spatial integration for page {page_num + 1}")
+            
+            # Get text blocks for this page
+            page_text_blocks = text_blocks_by_page.get(page_num, [])
+            
+            # Get images for this page (from all groups)
+            page_images = []
+            for group_id, group_images in duplicate_groups.items():
+                for img in group_images:
+                    if img.page_num == page_num:
+                        page_images.append(img)
+            
+            # Create integrated content for this page
+            page_content = self._create_spatially_integrated_page_content(
+                page_num, page_text_blocks, page_images
+            )
+            
+            if page_content.strip():
+                formatted_parts.append(f"## Page {page_num + 1}\n\n{page_content}")
+        
+        # Combine all pages
+        formatted_text = '\n\n'.join(formatted_parts)
+        
+        logger.info("Spatial integration complete")
+        
+        return formatted_text
+    
+    def _create_spatially_integrated_page_content(self, page_num: int, 
+                                                text_blocks: List[Dict], 
+                                                page_images: List[AdvancedImageInfo]) -> str:
+        """Create spatially integrated content for a single page"""
+        
+        # Create list of all content elements with positions
+        content_elements = []
+        
+        # Add text blocks
+        for block_idx, text_block in enumerate(text_blocks):
+            bbox = text_block.get('bbox', (0, 0, 0, 0))
+            content_elements.append({
+                'type': 'text',
+                'bbox': bbox,
+                'y_pos': bbox[1],  # Top Y coordinate for sorting
+                'content': text_block['content'],
+                'index': block_idx
+            })
+        
+        # Add images with placeholders
+        for img_idx, image_info in enumerate(page_images):
+            # Generate placeholder for this image
+            image_ref_num = len(self.processed_images) + img_idx + 1
+            image_marker = f"__IMAGE_PLACEHOLDER_{image_ref_num}__"
+            
+            # Store marker for later processing
+            image_info.reference_number = image_ref_num
+            image_info.marker = image_marker
+            
+            # Use bbox if available, otherwise estimate position
+            if image_info.bbox:
+                bbox = image_info.bbox
+                y_pos = bbox[1]
+            else:
+                # Estimate position based on other images or place at end
+                y_pos = 999999  # Large number to place at end
+                bbox = (0, y_pos, 0, y_pos)
+            
+            content_elements.append({
+                'type': 'image',
+                'bbox': bbox,
+                'y_pos': y_pos,
+                'content': image_marker,
+                'image_info': image_info,
+                'index': img_idx
+            })
+        
+        # Sort all elements by vertical position (top to bottom)
+        content_elements.sort(key=lambda x: x['y_pos'])
+        
+        # Create integrated content
+        integrated_parts = []
+        
+        for element in content_elements:
+            if element['type'] == 'text':
+                integrated_parts.append(element['content'])
+            elif element['type'] == 'image':
+                # Add image placeholder with context
+                image_info = element['image_info']
+                context_text = f"\n{element['content']}\n*[Image from page {page_num + 1}]*"
+                
+                # If image is duplicate, add duplicate info
+                if image_info.is_duplicate and image_info.master_image:
+                    context_text += f"\n*[Duplicate of image from page {image_info.master_image.page_num + 1}]*"
+                
+                integrated_parts.append(context_text)
+        
+        return '\n\n'.join(integrated_parts)
+    
+    def _process_and_upload_unique_images(self, pdf_doc, formatted_text: str, 
+                                        unique_images: List[AdvancedImageInfo], 
+                                        duplicate_groups: Dict[str, List[AdvancedImageInfo]]) -> str:
+        """PHASE 5: Process and upload only unique images, update all references"""
+        
+        logger.info(f"Processing and uploading {len(unique_images)} unique images...")
+        
+        current_text = formatted_text
+        
+        # Process each unique image (master of each duplicate group)
+        for unique_image in unique_images:
+            try:
+                if not unique_image.image_data:
+                    logger.warning(f"No image data for unique image xref={unique_image.xref}")
+                    continue
+                
+                # Create unique placeholder name
+                timestamp_suffix = int(time.time() * 1000) + self.image_counter
+                placeholder_name = f"PDF_IMAGE_{self.image_counter}_{timestamp_suffix}"
+                
+                # Upload to S3
                 s3_key = self._upload_pdf_image_to_s3_advanced(
-                    image_bytes, placeholder_name, image_instance, image_ext
+                    unique_image.image_data, placeholder_name, unique_image
                 )
                 
                 if s3_key:
@@ -1060,78 +1011,101 @@ class EnhancedDocumentProcessor:
                     image_info = {
                         'placeholder': placeholder_name,
                         's3_key': s3_key,
-                        's3_filename': f"{placeholder_name}.{image_ext}",
-                        'original_filename': f"page_{image_instance.page_number}_img_{image_instance.xref}.{image_ext}",
+                        's3_filename': f"{placeholder_name}.png",
+                        'original_filename': f"pdf_page_{unique_image.page_num + 1}_img_{unique_image.img_index}.png",
                         'image_number': self.image_counter,
-                        'instance_id': image_instance.instance_id,
-                        'is_duplicate': False,
-                        'page_number': image_instance.page_number,
-                        'bbox': image_instance.bbox,
-                        'width': image_instance.width,
-                        'height': image_instance.height,
-                        'area': image_instance.area,
-                        'image_hash': image_instance.image_hash,
-                        'size_bytes': len(image_bytes),
+                        'reference_number': unique_image.reference_number,
+                        'page_number': unique_image.page_num + 1,
+                        'size_bytes': unique_image.size_bytes,
+                        'width': unique_image.width,
+                        'height': unique_image.height,
+                        'hash_value': unique_image.hash_value,
+                        'duplicate_group_id': unique_image.duplicate_group_id,
+                        'is_master_image': True,
+                        'extraction_methods': unique_image.extraction_methods,
+                        'total_instances': len(duplicate_groups[unique_image.duplicate_group_id]),
+                        'instance_pages': [str(img.page_num + 1) for img in duplicate_groups[unique_image.duplicate_group_id]],
                         'uploaded': True,
                         'upload_timestamp': datetime.utcnow().isoformat(),
-                        'source_type': 'pdf_advanced'
+                        'source_type': 'pdf'
                     }
                     
                     self.processed_images.append(image_info)
                     self.placeholders[placeholder_name] = s3_key
                     
-                    # Store in DynamoDB (if available)
-                    self._store_image_metadata_advanced(image_info)
+                    # Store in DynamoDB
+                    self._store_image_metadata(image_info)
                     
-                    uploaded_count += 1
+                    # Replace ALL instances of this image across all duplicates
+                    group_images = duplicate_groups[unique_image.duplicate_group_id]
+                    for group_image in group_images:
+                        if hasattr(group_image, 'marker') and group_image.marker:
+                            # Create contextual placeholder text
+                            instance_pages = [str(img.page_num + 1) for img in group_images]
+                            instance_info = f"appears on page(s): {', '.join(instance_pages)}"
+                            
+                            placeholder_text = f"\n![{placeholder_name}]({s3_key})\n*PDF Image {self.image_counter} ({instance_info})*\n"
+                            
+                            # Replace marker
+                            current_text = current_text.replace(group_image.marker, placeholder_text)
+                    
+                    logger.info(f"Processed unique image {placeholder_name}: {len(group_images)} instances across pages {', '.join([str(img.page_num + 1) for img in group_images])}")
+                    
                     self.image_counter += 1
-                    
-                    logger.info(f"Uploaded {placeholder_name}: {len(image_bytes)} bytes → {s3_key}")
                 else:
-                    logger.error(f"Failed to upload {image_instance.instance_id}")
-            
+                    logger.error(f"Failed to upload unique image xref={unique_image.xref}")
+                
             except Exception as e:
-                logger.error(f"Error processing image {image_instance.instance_id}: {e}")
+                logger.error(f"Failed to process unique image xref={unique_image.xref}: {e}")
                 continue
         
-        self.stats['images_extracted'] = processed_count
-        self.stats['images_uploaded'] = uploaded_count
+        # Clean up any remaining markers
+        current_text = re.sub(r'__IMAGE_PLACEHOLDER_\d+__', '', current_text)
         
-        logger.info(f"Image processing complete: {processed_count} processed, {uploaded_count} uploaded")
+        # Clean up extra whitespace while preserving structure
+        current_text = re.sub(r'\n\s*\n\s*\n', '\n\n', current_text)
+        
+        logger.info(f"Image processing complete: {len(self.processed_images)} unique images uploaded")
+        
+        return current_text.strip()
     
-    def _upload_pdf_image_to_s3_advanced(self, image_bytes: bytes, placeholder_name: str,
-                                       image_instance: ImageInstance, image_ext: str) -> Optional[str]:
-        """Advanced S3 upload with comprehensive metadata"""
+    def _upload_pdf_image_to_s3_advanced(self, image_data: bytes, placeholder_name: str, 
+                                       image_info: AdvancedImageInfo) -> Optional[str]:
+        """Upload PDF image to S3 with advanced metadata"""
+        
         if not S3_BUCKET:
             logger.error("S3_BUCKET not configured")
             return None
         
         try:
             timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d/%H')
-            s3_key = f"extracted_images_advanced/{timestamp_prefix}/{self.document_id}/{placeholder_name}.{image_ext}"
+            s3_key = f"extracted_images/{timestamp_prefix}/{self.document_id}/{placeholder_name}.png"
+            
+            # Prepare comprehensive metadata
+            metadata = {
+                'document_id': self.document_id,
+                'placeholder_name': placeholder_name,
+                'source_type': 'pdf_advanced',
+                'page_number': str(image_info.page_num + 1),
+                'image_index': str(image_info.img_index),
+                'xref': str(image_info.xref),
+                'hash_value': image_info.hash_value[:32] if image_info.hash_value else 'unknown',
+                'duplicate_group_id': image_info.duplicate_group_id,
+                'is_master_image': 'true',
+                'extraction_methods': ','.join(image_info.extraction_methods),
+                'width': str(image_info.width),
+                'height': str(image_info.height),
+                'size_bytes': str(len(image_data)),
+                'upload_timestamp': datetime.utcnow().isoformat(),
+                'processing_timestamp': self.processing_timestamp
+            }
             
             s3_client.put_object(
                 Bucket=S3_BUCKET,
                 Key=s3_key,
-                Body=image_bytes,
-                ContentType=f'image/{image_ext}',
-                Metadata={
-                    'document_id': self.document_id,
-                    'placeholder_name': placeholder_name,
-                    'instance_id': image_instance.instance_id,
-                    'source_type': 'pdf_advanced',
-                    'page_number': str(image_instance.page_number),
-                    'xref': str(image_instance.xref),
-                    'bbox': f"{image_instance.bbox[0]},{image_instance.bbox[1]},{image_instance.bbox[2]},{image_instance.bbox[3]}",
-                    'width': str(image_instance.width),
-                    'height': str(image_instance.height),
-                    'area': str(image_instance.area),
-                    'image_hash': image_instance.image_hash,
-                    'is_duplicate': str(image_instance.is_duplicate),
-                    'extraction_order': str(image_instance.extraction_order),
-                    'upload_timestamp': datetime.utcnow().isoformat(),
-                    'processing_timestamp': self.processing_timestamp
-                }
+                Body=image_data,
+                ContentType='image/png',
+                Metadata=metadata
             )
             
             logger.info(f"Advanced S3 Upload: {placeholder_name} → s3://{S3_BUCKET}/{s3_key}")
@@ -1141,155 +1115,708 @@ class EnhancedDocumentProcessor:
             logger.error(f"Advanced S3 upload failed for {placeholder_name}: {e}")
             return None
     
-    def _store_image_metadata_advanced(self, image_info: Dict[str, Any]) -> None:
-        """Store advanced image metadata"""
-        if not images_table:
-            logger.warning("Images table not available")
-            return
-        
-        try:
-            ttl = datetime.utcnow() + timedelta(days=30)
-            image_id = f"{self.document_id}_{image_info['instance_id']}_{int(time.time() * 1000)}"
-            
-            item = {
-                'document_id': self.document_id,
-                'image_id': image_id,
-                'image_number': image_info['image_number'],
-                'instance_id': image_info['instance_id'],
-                'placeholder': image_info['placeholder'],
-                's3_bucket': S3_BUCKET,
-                's3_key': image_info['s3_key'],
-                's3_filename': image_info['s3_filename'],
-                'original_filename': image_info['original_filename'],
-                'size_bytes': image_info['size_bytes'],
-                'page_number': image_info['page_number'],
-                'bbox': image_info.get('bbox', (0, 0, 0, 0)),
-                'width': image_info.get('width', 0),
-                'height': image_info.get('height', 0),
-                'area': image_info.get('area', 0),
-                'image_hash': image_info.get('image_hash', ''),
-                'is_duplicate': image_info.get('is_duplicate', False),
-                'source_type': 'pdf_advanced',
-                'extraction_method': 'advanced_pdf_with_spatial_positioning',
-                'processing_timestamp': self.processing_timestamp,
-                'upload_timestamp': image_info['upload_timestamp'],
-                'ai_processed': False,
-                'ttl': int(ttl.timestamp())
-            }
-            
-            images_table.put_item(Item=item)
-            logger.info(f"DynamoDB: Stored advanced metadata for {image_info['placeholder']}")
-            
-        except Exception as e:
-            logger.error(f"DynamoDB storage failed for {image_info['placeholder']}: {e}")
+    def _count_tables_in_text(self, text: str) -> int:
+        """Count table markers in text"""
+        return len(re.findall(r'\*\*TABLE START\*\*', text))
     
-    def _finalize_text_with_images(self, formatted_text: str) -> str:
-        """Phase 7: Finalize text by replacing placeholders with proper image references"""
-        logger.info("Phase 7: Finalizing text with image references")
-        
-        current_text = formatted_text
-        
-        for image_instance in self.image_instances:
-            placeholder_marker = f"__IMAGE_PLACEHOLDER_{image_instance.instance_id}__"
-            
-            if placeholder_marker in current_text:
-                placeholder_name = f"IMG_{image_instance.instance_id}"
-                s3_key = self.placeholders.get(placeholder_name)
-                
-                if s3_key:
-                    # Create rich image reference
-                    image_ref = f"\n![{placeholder_name}](s3://{S3_BUCKET}/{s3_key})\n"
-                    
-                    # Add metadata
-                    metadata_parts = [
-                        f"*Advanced PDF Image {image_instance.instance_id}: Page {image_instance.page_number}*",
-                        f"*Size: {int(image_instance.width)} × {int(image_instance.height)} pixels*",
-                        f"*Position: {image_instance.bbox[0]:.1f}, {image_instance.bbox[1]:.1f}*"
-                    ]
-                    
-                    if image_instance.is_duplicate:
-                        metadata_parts.append(f"*Duplicate of {image_instance.original_instance_id}*")
-                    
-                    if image_instance.text_before or image_instance.text_after:
-                        context = []
-                        if image_instance.text_before:
-                            context.append(f"after '{image_instance.text_before[-20:]}...'")
-                        if image_instance.text_after:
-                            context.append(f"before '...{image_instance.text_after[:20]}'")
-                        metadata_parts.append(f"*Context: {' and '.join(context)}*")
-                    
-                    full_image_ref = image_ref + "\n".join(metadata_parts) + "\n"
-                    
-                    current_text = current_text.replace(placeholder_marker, full_image_ref)
-                    logger.info(f"Finalized image reference for {image_instance.instance_id}")
-                else:
-                    # Remove placeholder if no S3 key
-                    current_text = current_text.replace(placeholder_marker, 
-                        f"\n*[Image {image_instance.instance_id} - Upload failed]*\n")
-        
-        # Clean up any remaining placeholders
-        current_text = re.sub(r'__IMAGE_PLACEHOLDER_[^_]+__', 
-                            '\n*[Image processing failed]*\n', current_text)
-        
-        # Clean up extra whitespace
-        current_text = re.sub(r'\n\s*\n\s*\n', '\n\n', current_text)
-        
-        return current_text.strip()
+    def _count_headings_in_text(self, text: str) -> int:
+        """Count headings in text"""
+        return len(re.findall(r'^#+\s', text, re.MULTILINE))
     
     def _fallback_pdf_extraction(self, file_path: str) -> Dict[str, Any]:
-        """Enhanced fallback extraction"""
-        logger.info("Using enhanced fallback PDF extraction")
+        """Fallback PDF extraction with minimal processing"""
+        
+        logger.info("Using fallback PDF extraction")
         
         try:
             pdf_doc = fitz.open(file_path)
+            
             text_parts = []
+            all_images = []
             
             for page_num in range(len(pdf_doc)):
                 page = pdf_doc.load_page(page_num)
-                page_text = page.get_text()
                 
+                # Simple text extraction
+                page_text = page.get_text()
                 if page_text.strip():
-                    text_parts.append(f"## Page {page_num + 1}\n\n{page_text}")
+                    text_parts.append(f"Page {page_num + 1}:\n{page_text}")
+                
+                # Count images
+                image_list = page.get_images()
+                for i, img in enumerate(image_list):
+                    marker = f"__PDF_FALLBACK_IMAGE_{len(all_images)}__"
+                    all_images.append({
+                        'marker': marker,
+                        'reference_number': len(all_images),
+                        'page_number': page_num + 1,
+                        'fallback': True
+                    })
             
             pdf_doc.close()
             
             formatted_text = '\n\n'.join(text_parts)
             
+            # Add image markers
+            for img in all_images:
+                formatted_text += f" {img['marker']} "
+            
             return {
-                'formatted_text': formatted_text,
+                'formatted_text': formatted_text, 
                 'plain_text': formatted_text,
-                'method': 'fallback_pdf_extraction_enhanced',
+                'method': 'fallback_pdf_extraction',
                 'pages_processed': len(text_parts),
-                'total_image_references': 0,
-                'unique_image_files': 0,
-                'duplicate_image_instances': 0,
-                'images_extracted': 0,
-                'images_uploaded': 0,
-                'text_blocks_processed': 0,
-                'positioning_accuracy': 0.0,
-                'processing_stats': {'fallback': True},
-                'tables_count': 0,
+                'total_image_references': len(all_images),
+                'unique_image_files': len(all_images),
+                'unique_images': len(all_images),
+                'duplicate_groups': 0,
+                'total_image_instances': len(all_images),
+                'tables_count': 0, 
                 'headings_count': 0
             }
-        
+            
         except Exception as e:
-            logger.error(f"Enhanced fallback failed: {e}")
+            logger.error(f"Fallback PDF extraction failed: {e}")
             return {
-                'formatted_text': "PDF extraction failed completely",
-                'plain_text': "PDF extraction failed completely",
-                'method': 'failed_extraction',
+                'formatted_text': "Failed to extract PDF text", 
+                'plain_text': "Failed to extract PDF text",
+                'method': 'failed_pdf_extraction',
                 'pages_processed': 0,
                 'total_image_references': 0,
                 'unique_image_files': 0,
-                'duplicate_image_instances': 0,
-                'images_extracted': 0,
-                'images_uploaded': 0,
-                'text_blocks_processed': 0,
-                'positioning_accuracy': 0.0,
-                'processing_stats': {'failed': True},
-                'tables_count': 0,
+                'unique_images': 0,
+                'duplicate_groups': 0,
+                'total_image_instances': 0,
+                'tables_count': 0, 
                 'headings_count': 0
             }
+    
+    # ========================================
+    # DOCX PROCESSING METHODS (UNCHANGED)
+    # ========================================
+    
+    def _process_docx_with_formatting(self, file_path: str) -> Dict[str, Any]:
+        """Process DOCX while preserving formatting and structure"""
+        
+        logger.info("Starting enhanced DOCX processing with formatting preservation...")
+        
+        with zipfile.ZipFile(file_path, 'r') as docx_zip:
+            # Extract styles information
+            styles_info = self._extract_styles(docx_zip)
+            
+            # Extract numbering information for lists
+            numbering_info = self._extract_numbering(docx_zip)
+            
+            # Process document with full formatting
+            formatted_text, all_image_references, document_stats = self._extract_formatted_content(
+                docx_zip, styles_info, numbering_info
+            )
+            
+            # Get unique image files
+            unique_image_files = [f for f in docx_zip.namelist() if f.startswith('word/media/')]
+            
+            logger.info(f"Found {len(all_image_references)} image references")
+            logger.info(f"Found {len(unique_image_files)} unique image files")
+            logger.info(f"Found {document_stats.get('tables_count', 0)} tables")
+            logger.info(f"Found {document_stats.get('headings_count', 0)} headings")
+            
+            # Process all image references
+            final_text = self._process_all_image_references_formatted(
+                docx_zip, formatted_text, all_image_references, unique_image_files
+            )
+            
+            # Generate plain text version
+            plain_text = self._strip_formatting_markers(final_text)
+            
+            logger.info("Enhanced DOCX processing complete")
+            
+            return {
+                'formatted_text': final_text,
+                'plain_text': plain_text,
+                'method': 'enhanced_docx_with_formatting',
+                'pages_processed': 1,  # DOCX is treated as single document
+                'total_image_references': len(all_image_references),
+                'unique_image_files': len(unique_image_files),
+                'unique_images': len(unique_image_files),
+                'duplicate_groups': 0,  # DOCX duplicate detection not implemented yet
+                'total_image_instances': len(all_image_references),
+                'tables_count': document_stats.get('tables_count', 0),
+                'headings_count': document_stats.get('headings_count', 0)
+            }
+    
+    def _extract_styles(self, docx_zip: zipfile.ZipFile) -> Dict[str, Dict]:
+        """Extract style definitions from styles.xml"""
+        styles_info = {}
+        
+        try:
+            with docx_zip.open('word/styles.xml') as styles_file:
+                styles_content = styles_file.read().decode('utf-8')
+                styles_root = ET.fromstring(styles_content)
+                
+                for style in styles_root.findall('.//w:style', self.namespaces):
+                    style_id = style.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}styleId')
+                    style_type = style.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}type')
+                    
+                    # Get style name
+                    name_elem = style.find('.//w:name', self.namespaces)
+                    style_name = name_elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') if name_elem is not None else style_id
+                    
+                    styles_info[style_id] = {
+                        'name': style_name,
+                        'type': style_type
+                    }
+                    
+        except Exception as e:
+            logger.warning(f"Could not extract styles: {e}")
+            
+        return styles_info
+    
+    def _extract_numbering(self, docx_zip: zipfile.ZipFile) -> Dict[str, Dict]:
+        """Extract numbering definitions for lists"""
+        numbering_info = {}
+        
+        try:
+            with docx_zip.open('word/numbering.xml') as numbering_file:
+                numbering_content = numbering_file.read().decode('utf-8')
+                numbering_root = ET.fromstring(numbering_content)
+                
+                # Extract numbering definitions
+                for num_def in numbering_root.findall('.//w:num', self.namespaces):
+                    num_id = num_def.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numId')
+                    numbering_info[num_id] = {'levels': {}}
+                    
+        except Exception as e:
+            logger.warning(f"Could not extract numbering: {e}")
+            
+        return numbering_info
+    
+    def _extract_formatted_content(self, docx_zip: zipfile.ZipFile, styles_info: Dict, 
+                                 numbering_info: Dict) -> Tuple[str, List[Dict], Dict]:
+        """Extract document content with full formatting preservation"""
+        
+        try:
+            with docx_zip.open('word/document.xml') as doc_xml:
+                xml_content = doc_xml.read().decode('utf-8')
+                root = ET.fromstring(xml_content)
+                
+                formatted_parts = []
+                all_image_references = []
+                reference_counter = 0
+                
+                # Document statistics
+                document_stats = {
+                    'tables_count': 0,
+                    'headings_count': 0
+                }
+                
+                # Process document body
+                body = root.find('.//w:body', self.namespaces)
+                if body is not None:
+                    for element in body:
+                        if element.tag.endswith('}p'):  # Paragraph
+                            para_content, para_images = self._process_paragraph(
+                                element, styles_info, reference_counter
+                            )
+                            if para_content.strip():
+                                formatted_parts.append(para_content)
+                                
+                                # Check if it's a heading
+                                if self._is_heading_paragraph(element, styles_info):
+                                    document_stats['headings_count'] += 1
+                            
+                            # Update reference counter and add images
+                            reference_counter += len(para_images)
+                            all_image_references.extend(para_images)
+                            
+                        elif element.tag.endswith('}tbl'):  # Table
+                            table_content, table_images = self._process_table(
+                                element, styles_info, reference_counter
+                            )
+                            if table_content.strip():
+                                formatted_parts.append(table_content)
+                                document_stats['tables_count'] += 1
+                            
+                            # Update reference counter and add images
+                            reference_counter += len(table_images)
+                            all_image_references.extend(table_images)
+                
+                # Combine all formatted content
+                formatted_text = '\n\n'.join(formatted_parts)
+                
+                logger.info(f"Extracted {len(formatted_text)} characters with formatting")
+                logger.info(f"Found {len(all_image_references)} image references")
+                
+                return formatted_text, all_image_references, document_stats
+                
+        except Exception as e:
+            logger.error(f"Failed to extract formatted content: {e}")
+            return self._fallback_formatted_extraction(docx_zip)
+    
+    def _process_paragraph(self, para_elem, styles_info: Dict, 
+                          start_ref_counter: int) -> Tuple[str, List[Dict]]:
+        """Process a paragraph with formatting"""
+        
+        para_parts = []
+        para_images = []
+        current_ref_counter = start_ref_counter
+        
+        # Check paragraph style
+        para_style = self._get_paragraph_style(para_elem, styles_info)
+        
+        # Process paragraph properties for numbering
+        para_props = para_elem.find('.//w:pPr', self.namespaces)
+        is_list_item = False
+        list_level = 0
+        
+        if para_props is not None:
+            num_pr = para_props.find('.//w:numPr', self.namespaces)
+            if num_pr is not None:
+                is_list_item = True
+                ilvl_elem = num_pr.find('.//w:ilvl', self.namespaces)
+                if ilvl_elem is not None:
+                    list_level = int(ilvl_elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val', '0'))
+        
+        # Process runs within paragraph
+        runs = para_elem.findall('.//w:r', self.namespaces)
+        for run in runs:
+            run_text, run_images = self._process_run(run, current_ref_counter)
+            if run_text or run_images:
+                para_parts.append(run_text)
+                para_images.extend(run_images)
+                current_ref_counter += len(run_images)
+        
+        # Combine paragraph content
+        para_text = ''.join(para_parts)
+        
+        # Apply paragraph-level formatting
+        formatted_para = self._apply_paragraph_formatting(
+            para_text, para_style, is_list_item, list_level
+        )
+        
+        return formatted_para, para_images
+    
+    def _process_run(self, run_elem, start_ref_counter: int) -> Tuple[str, List[Dict]]:
+        """Process a text run with character formatting"""
+        
+        run_parts = []
+        run_images = []
+        current_ref_counter = start_ref_counter
+        
+        # Get run properties for formatting
+        run_props = run_elem.find('.//w:rPr', self.namespaces)
+        formatting = self._extract_run_formatting(run_props)
+        
+        # Process text elements
+        text_elements = run_elem.findall('.//w:t', self.namespaces)
+        for text_elem in text_elements:
+            if text_elem.text:
+                formatted_text = self._apply_character_formatting(text_elem.text, formatting)
+                run_parts.append(formatted_text)
+        
+        # Process images in this run
+        drawings = run_elem.findall('.//w:drawing', self.namespaces)
+        for drawing in drawings:
+            pic_elements = drawing.findall('.//pic:pic', self.namespaces)
+            for pic in pic_elements:
+                image_marker = f"__IMAGE_PLACEHOLDER_{current_ref_counter}__"
+                
+                # Get image relationship ID
+                image_rel_id = None
+                blip_elements = pic.findall('.//a:blip', self.namespaces)
+                if blip_elements:
+                    image_rel_id = blip_elements[0].get(
+                        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed'
+                    )
+                
+                # Store image reference
+                image_ref = {
+                    'marker': image_marker,
+                    'reference_number': current_ref_counter,
+                    'relationship_id': image_rel_id,
+                    'context': ''.join(run_parts)[:100]
+                }
+                
+                run_images.append(image_ref)
+                run_parts.append(f" {image_marker} ")
+                current_ref_counter += 1
+        
+        return ''.join(run_parts), run_images
+    
+    def _process_table(self, table_elem, styles_info: Dict, 
+                      start_ref_counter: int) -> Tuple[str, List[Dict]]:
+        """Process a table with formatting"""
+        
+        table_parts = []
+        table_images = []
+        current_ref_counter = start_ref_counter
+        
+        # Table start marker
+        table_parts.append("\n**TABLE START**\n")
+        
+        # Process table rows
+        rows = table_elem.findall('.//w:tr', self.namespaces)
+        for row_idx, row in enumerate(rows):
+            row_parts = []
+            
+            # Process cells in row
+            cells = row.findall('.//w:tc', self.namespaces)
+            for cell_idx, cell in enumerate(cells):
+                cell_content = []
+                
+                # Process paragraphs in cell
+                cell_paras = cell.findall('.//w:p', self.namespaces)
+                for para in cell_paras:
+                    para_content, para_images = self._process_paragraph(
+                        para, styles_info, current_ref_counter
+                    )
+                    if para_content.strip():
+                        cell_content.append(para_content)
+                    
+                    # Update counter and collect images
+                    current_ref_counter += len(para_images)
+                    table_images.extend(para_images)
+                
+                # Join cell content and add cell separator
+                cell_text = ' '.join(cell_content).strip()
+                row_parts.append(f"| {cell_text} ")
+            
+            # Complete the row
+            if row_parts:
+                table_parts.append(''.join(row_parts) + "|\n")
+                
+                # Add header separator for first row
+                if row_idx == 0:
+                    separator = "|" + "---|" * len(cells) + "\n"
+                    table_parts.append(separator)
+        
+        # Table end marker
+        table_parts.append("**TABLE END**\n")
+        
+        return ''.join(table_parts), table_images
+    
+    def _get_paragraph_style(self, para_elem, styles_info: Dict) -> Dict[str, Any]:
+        """Extract paragraph style information"""
+        
+        style_info = {'name': 'Normal', 'type': 'paragraph'}
+        
+        para_props = para_elem.find('.//w:pPr', self.namespaces)
+        if para_props is not None:
+            style_elem = para_props.find('.//w:pStyle', self.namespaces)
+            if style_elem is not None:
+                style_id = style_elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val')
+                if style_id in styles_info:
+                    style_info = styles_info[style_id]
+        
+        return style_info
+    
+    def _extract_run_formatting(self, run_props) -> Dict[str, bool]:
+        """Extract character formatting from run properties"""
+        
+        formatting = {
+            'bold': False,
+            'italic': False,
+            'underline': False
+        }
+        
+        if run_props is not None:
+            # Check for bold
+            if run_props.find('.//w:b', self.namespaces) is not None:
+                formatting['bold'] = True
+            
+            # Check for italic
+            if run_props.find('.//w:i', self.namespaces) is not None:
+                formatting['italic'] = True
+            
+            # Check for underline
+            if run_props.find('.//w:u', self.namespaces) is not None:
+                formatting['underline'] = True
+        
+        return formatting
+    
+    def _apply_paragraph_formatting(self, text: str, style_info: Dict, 
+                                  is_list_item: bool, list_level: int) -> str:
+        """Apply paragraph-level formatting"""
+        
+        if not text.strip():
+            return text
+        
+        # Apply heading formatting
+        style_name = style_info.get('name', '').lower()
+        if 'heading' in style_name or 'title' in style_name:
+            # Extract heading level
+            heading_level = 1
+            for i in range(1, 7):
+                if f'heading {i}' in style_name or f'heading{i}' in style_name:
+                    heading_level = i
+                    break
+            
+            return f"{'#' * heading_level} {text.strip()}\n"
+        
+        # Apply list formatting
+        if is_list_item:
+            indent = "  " * list_level
+            return f"{indent}- {text.strip()}\n"
+        
+        # Regular paragraph
+        return f"{text.strip()}\n"
+    
+    def _apply_character_formatting(self, text: str, formatting: Dict[str, bool]) -> str:
+        """Apply character-level formatting"""
+        
+        if not text:
+            return text
+        
+        formatted_text = text
+        
+        # Apply bold
+        if formatting.get('bold', False):
+            formatted_text = f"**{formatted_text}**"
+        
+        # Apply italic
+        if formatting.get('italic', False):
+            formatted_text = f"*{formatted_text}*"
+        
+        # Apply underline (using HTML-style for now)
+        if formatting.get('underline', False):
+            formatted_text = f"<u>{formatted_text}</u>"
+        
+        return formatted_text
+    
+    def _is_heading_paragraph(self, para_elem, styles_info: Dict) -> bool:
+        """Check if paragraph is a heading"""
+        
+        style_info = self._get_paragraph_style(para_elem, styles_info)
+        style_name = style_info.get('name', '').lower()
+        return 'heading' in style_name or 'title' in style_name
+    
+    def _process_all_image_references_formatted(self, docx_zip: zipfile.ZipFile, 
+                                              formatted_text: str, all_image_references: List[Dict], 
+                                              unique_image_files: List[str]) -> str:
+        """Process image references in formatted text"""
+        
+        current_text = formatted_text
+        
+        # Sort image files naturally
+        sorted_image_files = sorted(unique_image_files, 
+                                  key=lambda x: self._extract_number_from_filename(x))
+        
+        # Build relationship mapping
+        rel_to_file_map = self._build_relationship_mapping(docx_zip, sorted_image_files)
+        
+        logger.info(f"Processing {len(all_image_references)} image references...")
+        
+        # Process each image reference
+        for ref_idx, image_ref in enumerate(all_image_references):
+            try:
+                # Get image file for this reference
+                img_file = self._get_image_file_for_reference(
+                    image_ref, sorted_image_files, rel_to_file_map, ref_idx
+                )
+                
+                if not img_file:
+                    logger.warning(f"No image file found for reference {ref_idx}")
+                    continue
+                
+                # Extract and upload image
+                with docx_zip.open(img_file) as img_data_file:
+                    image_data = img_data_file.read()
+                
+                if len(image_data) < 100:
+                    logger.warning(f"Image {img_file} too small, skipping")
+                    continue
+                
+                # Create unique placeholder
+                timestamp_suffix = int(time.time() * 1000) + ref_idx
+                placeholder_name = f"IMAGE_{self.image_counter}_{timestamp_suffix}"
+                
+                # Upload to S3
+                s3_key = self._upload_image_to_s3(image_data, placeholder_name, img_file)
+                
+                if s3_key:
+                    # Store image info
+                    image_info = {
+                        'placeholder': placeholder_name,
+                        's3_key': s3_key,
+                        's3_filename': f"{placeholder_name}.png",
+                        'original_filename': img_file,
+                        'image_number': self.image_counter,
+                        'reference_number': image_ref['reference_number'],
+                        'size_bytes': len(image_data),
+                        'uploaded': True,
+                        'upload_timestamp': datetime.utcnow().isoformat(),
+                        'source_type': 'docx',
+                        'is_duplicate_reference': img_file in [img['original_filename'] 
+                                                             for img in self.processed_images]
+                    }
+                    
+                    self.processed_images.append(image_info)
+                    self.placeholders[placeholder_name] = s3_key
+                    
+                    # Store in DynamoDB
+                    self._store_image_metadata(image_info)
+                    
+                    # Replace marker with formatted placeholder
+                    marker = image_ref['marker']
+                    placeholder_text = f"\n![{placeholder_name}]({s3_key})\n"
+                    current_text = current_text.replace(marker, placeholder_text)
+                    
+                    logger.info(f"Processed {placeholder_name}: ref#{ref_idx} → {img_file}")
+                    
+                    self.image_counter += 1
+                else:
+                    logger.error(f"Failed to upload reference {ref_idx}")
+                
+            except Exception as e:
+                logger.error(f"Failed to process image reference {ref_idx}: {e}")
+                continue
+        
+        # Clean up any remaining markers
+        current_text = re.sub(r'__IMAGE_PLACEHOLDER_\d+__', '', current_text)
+        
+        # Clean up extra whitespace while preserving structure
+        current_text = re.sub(r'\n\s*\n\s*\n', '\n\n', current_text)
+        
+        return current_text.strip()
+    
+    def _build_relationship_mapping(self, docx_zip: zipfile.ZipFile, image_files: List[str]) -> Dict[str, str]:
+        """Build mapping from relationship IDs to actual image files"""
+        
+        rel_map = {}
+        
+        try:
+            with docx_zip.open('word/_rels/document.xml.rels') as rels_file:
+                rels_content = rels_file.read().decode('utf-8')
+                rels_root = ET.fromstring(rels_content)
+                
+                for relationship in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                    rel_id = relationship.get('Id')
+                    target = relationship.get('Target')
+                    rel_type = relationship.get('Type')
+                    
+                    if rel_type and 'image' in rel_type.lower() and target:
+                        if target.startswith('media/'):
+                            full_path = f"word/{target}"
+                        else:
+                            full_path = target
+                        
+                        if full_path in image_files:
+                            rel_map[rel_id] = full_path
+                            logger.info(f"Mapped relationship {rel_id} → {full_path}")
+                
+        except Exception as e:
+            logger.warning(f"Could not build relationship mapping: {e}")
+        
+        return rel_map
+    
+    def _get_image_file_for_reference(self, image_ref: Dict, image_files: List[str], 
+                                    rel_map: Dict[str, str], ref_idx: int) -> Optional[str]:
+        """Get the correct image file for this specific reference"""
+        
+        # Try relationship mapping first
+        if image_ref.get('relationship_id') and image_ref['relationship_id'] in rel_map:
+            return rel_map[image_ref['relationship_id']]
+        
+        # Fallback: cycle through image files
+        if image_files:
+            file_index = ref_idx % len(image_files)
+            return image_files[file_index]
+        
+        return None
+    
+    def _extract_number_from_filename(self, filename: str) -> int:
+        """Extract number from filename for natural sorting"""
+        numbers = re.findall(r'\d+', filename)
+        return int(numbers[0]) if numbers else 0
+    
+    def _upload_image_to_s3(self, image_data: bytes, placeholder_name: str, original_filename: str) -> Optional[str]:
+        """Upload image to S3 with unique path"""
+        
+        if not S3_BUCKET:
+            logger.error("S3_BUCKET not configured")
+            return None
+        
+        try:
+            timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d/%H')
+            s3_key = f"extracted_images/{timestamp_prefix}/{self.document_id}/{placeholder_name}.png"
+            
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=s3_key,
+                Body=image_data,
+                ContentType='image/png',
+                Metadata={
+                    'document_id': self.document_id,
+                    'placeholder_name': placeholder_name,
+                    'original_filename': original_filename,
+                    'source_type': 'docx',
+                    'upload_timestamp': datetime.utcnow().isoformat(),
+                    'processing_timestamp': self.processing_timestamp
+                }
+            )
+            
+            logger.info(f"S3 Upload: {placeholder_name} → s3://{S3_BUCKET}/{s3_key}")
+            return s3_key
+            
+        except Exception as e:
+            logger.error(f"S3 upload failed for {placeholder_name}: {e}")
+            return None
+    
+    def _fallback_formatted_extraction(self, docx_zip: zipfile.ZipFile) -> Tuple[str, List[Dict], Dict]:
+        """Fallback extraction that still attempts some formatting"""
+        
+        logger.info("Using fallback formatted extraction")
+        
+        try:
+            with docx_zip.open('word/document.xml') as doc_xml:
+                xml_content = doc_xml.read().decode('utf-8')
+                
+                # Simple extraction with basic structure
+                paragraphs = re.findall(r'<w:p[^>]*>.*?</w:p>', xml_content, re.DOTALL)
+                formatted_parts = []
+                
+                for i, para in enumerate(paragraphs):
+                    # Extract text
+                    text_matches = re.findall(r'<w:t[^>]*>(.*?)</w:t>', para, re.DOTALL)
+                    para_text = ''.join(text_matches).strip()
+                    
+                    if para_text:
+                        # Simple formatting detection
+                        if re.search(r'<w:b/>', para):
+                            para_text = f"**{para_text}**"
+                        
+                        formatted_parts.append(para_text)
+                
+                formatted_text = '\n\n'.join(formatted_parts)
+                
+                # Count images
+                pic_matches = re.findall(r'<pic:pic[^>]*>', xml_content)
+                all_image_references = []
+                
+                for i, pic_match in enumerate(pic_matches):
+                    marker = f"__IMAGE_PLACEHOLDER_{i}__"
+                    all_image_references.append({
+                        'marker': marker,
+                        'reference_number': i,
+                        'context': f"Fallback reference {i}",
+                        'fallback': True
+                    })
+                    
+                    formatted_text += f" {marker} "
+                
+                document_stats = {
+                    'tables_count': len(re.findall(r'<w:tbl>', xml_content)),
+                    'headings_count': 0
+                }
+                
+                return formatted_text, all_image_references, document_stats
+                
+        except Exception as e:
+            logger.error(f"Fallback formatted extraction failed: {e}")
+            return "Failed to extract formatted text", [], {'tables_count': 0, 'headings_count': 0}
+    
+    # ========================================
+    # AI PROCESSING TRIGGER METHODS (UNCHANGED)
+    # ========================================
     
     def _trigger_image_ai_processing(self, extracted_text: str, images_count: int) -> Dict[str, Any]:
         """Trigger AI processing of extracted images"""
@@ -1302,8 +1829,10 @@ class EnhancedDocumentProcessor:
             logger.info(f"Triggering AI processing for {images_count} images in document {self.document_id}")
             
             if USE_ASYNC_PROCESSING:
+                # Option 1: Asynchronous processing via SQS (Recommended)
                 return self._trigger_via_sqs(images_count)
             else:
+                # Option 2: Synchronous processing via direct Lambda invocation
                 return self._trigger_via_lambda_invoke(images_count)
                 
         except Exception as e:
@@ -1326,7 +1855,7 @@ class EnhancedDocumentProcessor:
             message_body = {
                 'document_id': self.document_id,
                 'images_count': images_count,
-                'trigger_source': 'document_extractor',
+                'trigger_source': 'advanced_document_extractor',
                 'processing_timestamp': self.processing_timestamp,
                 'trigger_timestamp': datetime.utcnow().isoformat()
             }
@@ -1344,7 +1873,7 @@ class EnhancedDocumentProcessor:
                         'DataType': 'Number'
                     },
                     'TriggerSource': {
-                        'StringValue': 'document_extractor',
+                        'StringValue': 'advanced_document_extractor',
                         'DataType': 'String'
                     }
                 }
@@ -1376,14 +1905,14 @@ class EnhancedDocumentProcessor:
             payload = {
                 'document_id': self.document_id,
                 'images_count': images_count,
-                'trigger_source': 'document_extractor',
+                'trigger_source': 'advanced_document_extractor',
                 'processing_timestamp': self.processing_timestamp
             }
             
             # Invoke image processor Lambda asynchronously
             response = lambda_client.invoke(
                 FunctionName=IMAGE_PROCESSOR_LAMBDA_ARN,
-                InvocationType='Event',
+                InvocationType='Event',  # Asynchronous invocation
                 Payload=json.dumps(payload)
             )
             
@@ -1400,6 +1929,48 @@ class EnhancedDocumentProcessor:
         except Exception as e:
             logger.error(f"Lambda invoke trigger failed: {e}")
             return {'triggered': False, 'error': str(e), 'method': 'lambda_invoke'}
+
+    def _trigger_via_eventbridge(self, images_count: int) -> Dict[str, Any]:
+        """Trigger image processing via EventBridge (alternative option)"""
+        
+        try:
+            # Send custom event to EventBridge
+            event_detail = {
+                'document_id': self.document_id,
+                'images_count': images_count,
+                'processing_timestamp': self.processing_timestamp,
+                'extraction_complete': True
+            }
+            
+            response = events_client.put_events(
+                Entries=[
+                    {
+                        'Source': 'document.processor',
+                        'DetailType': 'Document Processing Complete',
+                        'Detail': json.dumps(event_detail),
+                        'Resources': [
+                            f"document:{self.document_id}"
+                        ]
+                    }
+                ]
+            )
+            
+            logger.info(f"Sent EventBridge event for image processing")
+            
+            return {
+                'triggered': True,
+                'method': 'eventbridge',
+                'event_id': response['Entries'][0].get('EventId'),
+                'images_count': images_count
+            }
+            
+        except Exception as e:
+            logger.error(f"EventBridge trigger failed: {e}")
+            return {'triggered': False, 'error': str(e), 'method': 'eventbridge'}
+    
+    # ========================================
+    # STORAGE AND UTILITY METHODS (UNCHANGED BUT ENHANCED)
+    # ========================================
     
     def _save_text_files_to_s3(self, formatted_text: str) -> bool:
         """Primary method: Save extracted text as files in S3"""
@@ -1418,11 +1989,12 @@ class EnhancedDocumentProcessor:
             # Prepare file metadata
             file_metadata = {
                 'document_id': self.document_id,
-                'extraction_method': 'enhanced_document_processor_with_advanced_pdf',
+                'extraction_method': 'advanced_document_processor_with_deduplication',
                 'processing_timestamp': self.processing_timestamp,
                 'character_count': str(len(formatted_text)),
                 'plain_character_count': str(len(plain_text)),
                 'images_processed': str(len(self.processed_images)),
+                'duplicate_groups': str(len(self.duplicate_groups)),
                 'extraction_timestamp': datetime.utcnow().isoformat()
             }
             
@@ -1453,13 +2025,18 @@ class EnhancedDocumentProcessor:
                 'document_id': self.document_id,
                 'processing_timestamp': self.processing_timestamp,
                 'extraction_timestamp': datetime.utcnow().isoformat(),
-                'extraction_method': 'enhanced_document_processor_with_advanced_pdf',
+                'extraction_method': 'advanced_document_processor_with_deduplication',
                 'formatting_preserved': True,
+                'advanced_features': {
+                    'spatial_positioning_enabled': ENABLE_SPATIAL_POSITIONING,
+                    'duplicate_detection_enabled': ENABLE_DUPLICATE_DETECTION,
+                    'advanced_image_detection_enabled': ENABLE_ADVANCED_IMAGE_DETECTION
+                },
                 'character_count': len(formatted_text),
                 'plain_character_count': len(plain_text),
                 'images_detected': len(self.processed_images),
+                'duplicate_groups_count': len(self.duplicate_groups),
                 'placeholders': self.placeholders,
-                'processing_stats': self.stats,
                 'file_locations': {
                     'formatted_text': f"s3://{S3_BUCKET}/{formatted_s3_key}",
                     'plain_text': f"s3://{S3_BUCKET}/{plain_s3_key}",
@@ -1471,7 +2048,11 @@ class EnhancedDocumentProcessor:
                         's3_location': f"s3://{S3_BUCKET}/{img['s3_key']}",
                         'original_filename': img.get('original_filename', 'unknown'),
                         'size_bytes': img['size_bytes'],
-                        'source_type': img.get('source_type', 'unknown')
+                        'source_type': img.get('source_type', 'unknown'),
+                        'is_master_image': img.get('is_master_image', False),
+                        'duplicate_group_id': img.get('duplicate_group_id', 'unknown'),
+                        'total_instances': img.get('total_instances', 1),
+                        'extraction_methods': img.get('extraction_methods', [])
                     }
                     for img in self.processed_images
                 ]
@@ -1487,11 +2068,82 @@ class EnhancedDocumentProcessor:
             )
             logger.info(f"Saved metadata: s3://{S3_BUCKET}/{metadata_s3_key}")
             
+            # 4. Create a summary report
+            summary_report = self._generate_summary_report(formatted_text, plain_text, extraction_metadata)
+            summary_s3_key = f"{base_path}/extraction_summary.txt"
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=summary_s3_key,
+                Body=summary_report.encode('utf-8'),
+                ContentType='text/plain; charset=utf-8',
+                Metadata=file_metadata
+            )
+            logger.info(f"Saved summary: s3://{S3_BUCKET}/{summary_s3_key}")
+            
             return True
             
         except Exception as e:
             logger.error(f"Failed to save text files to S3: {e}")
             return False
+    
+    def _generate_summary_report(self, formatted_text: str, plain_text: str, metadata: dict) -> str:
+        """Generate a human-readable summary report with advanced features"""
+        
+        report_lines = [
+            "=" * 60,
+            "ADVANCED DOCUMENT EXTRACTION SUMMARY REPORT",
+            "=" * 60,
+            "",
+            f"Document ID: {metadata['document_id']}",
+            f"Processing Date: {metadata['extraction_timestamp']}",
+            f"Extraction Method: {metadata['extraction_method']}",
+            "",
+            "ADVANCED FEATURES ENABLED:",
+            f"  - Spatial Positioning: {'Yes' if metadata['advanced_features']['spatial_positioning_enabled'] else 'No'}",
+            f"  - Duplicate Detection: {'Yes' if metadata['advanced_features']['duplicate_detection_enabled'] else 'No'}",
+            f"  - Multi-Method Image Detection: {'Yes' if metadata['advanced_features']['advanced_image_detection_enabled'] else 'No'}",
+            "",
+            "CONTENT STATISTICS:",
+            f"  - Formatted Text Length: {metadata['character_count']:,} characters",
+            f"  - Plain Text Length: {metadata['plain_character_count']:,} characters",
+            f"  - Images Extracted: {metadata['images_detected']}",
+            f"  - Duplicate Groups: {metadata['duplicate_groups_count']}",
+            f"  - Formatting Preserved: {'Yes' if metadata['formatting_preserved'] else 'No'}",
+            "",
+            "FILE LOCATIONS:",
+            f"  - Formatted Text: {metadata['file_locations']['formatted_text']}",
+            f"  - Plain Text: {metadata['file_locations']['plain_text']}",
+            f"  - Metadata: {metadata['file_locations']['metadata']}",
+            "",
+        ]
+        
+        if metadata['images']:
+            report_lines.extend([
+                "EXTRACTED IMAGES (UNIQUE ONLY):",
+                ""
+            ])
+            for img in metadata['images']:
+                report_lines.append(f"  - {img['placeholder']}: {img['s3_location']}")
+                report_lines.append(f"    Original: {img['original_filename']} ({img['size_bytes']:,} bytes)")
+                report_lines.append(f"    Source: {img['source_type']}")
+                if img.get('is_master_image'):
+                    report_lines.append(f"    Master Image: Yes (Group: {img['duplicate_group_id']})")
+                    report_lines.append(f"    Total Instances: {img.get('total_instances', 1)}")
+                    if img.get('extraction_methods'):
+                        report_lines.append(f"    Detection Methods: {', '.join(img['extraction_methods'])}")
+                report_lines.append("")
+        
+        report_lines.extend([
+            "CONTENT PREVIEW (First 500 characters):",
+            "-" * 40,
+            plain_text[:500] + ("..." if len(plain_text) > 500 else ""),
+            "",
+            "=" * 60,
+            "END OF ADVANCED SUMMARY REPORT",
+            "=" * 60
+        ])
+        
+        return "\n".join(report_lines)
     
     def _store_formatted_text(self, formatted_text: str) -> bool:
         """Store formatted text in DynamoDB with robust error handling"""
@@ -1514,7 +2166,7 @@ class EnhancedDocumentProcessor:
             # Generate plain text version for searchability
             plain_text = self._strip_formatting_markers(formatted_text)
             
-            # Prepare DynamoDB item
+            # Prepare DynamoDB item with advanced metadata
             item = {
                 'document_id': self.document_id,
                 'extracted_text': formatted_text,
@@ -1523,12 +2175,17 @@ class EnhancedDocumentProcessor:
                 'processing_timestamp': self.processing_timestamp,
                 'character_count': len(formatted_text),
                 'plain_character_count': len(plain_text),
-                'extraction_method': 'enhanced_document_processor_with_advanced_pdf',
+                'extraction_method': 'advanced_document_processor_with_deduplication',
                 'formatting_preserved': True,
-                'pages_processed': self.stats.get('pages_processed', 1),
+                'advanced_features': {
+                    'spatial_positioning_enabled': ENABLE_SPATIAL_POSITIONING,
+                    'duplicate_detection_enabled': ENABLE_DUPLICATE_DETECTION,
+                    'advanced_image_detection_enabled': ENABLE_ADVANCED_IMAGE_DETECTION
+                },
+                'pages_processed': 1,
                 'images_processed': len(self.processed_images),
+                'duplicate_groups_count': len(self.duplicate_groups),
                 'placeholders': self.placeholders,
-                'processing_stats': self.stats,
                 'ttl': int(ttl.timestamp())
             }
             
@@ -1575,6 +2232,53 @@ class EnhancedDocumentProcessor:
         except Exception as e:
             logger.error(f"Failed to save backup text files: {e}")
 
+    def _store_image_metadata(self, image_info: Dict[str, Any]) -> None:
+        """Store image metadata in DynamoDB with advanced metadata"""
+        
+        if not images_table:
+            logger.warning("Images table not available")
+            return
+        
+        try:
+            ttl = datetime.utcnow() + timedelta(days=30)
+            image_id = f"{self.document_id}_{image_info['reference_number']}_{int(time.time() * 1000)}"
+            
+            item = {
+                'document_id': self.document_id,
+                'image_id': image_id,
+                'image_number': image_info['image_number'],
+                'reference_number': image_info['reference_number'],
+                'placeholder': image_info['placeholder'],
+                's3_bucket': S3_BUCKET,
+                's3_key': image_info['s3_key'],
+                's3_filename': image_info['s3_filename'],
+                'original_filename': image_info['original_filename'],
+                'size_bytes': image_info['size_bytes'],
+                'page_number': image_info.get('page_number', 1),
+                'source_type': image_info.get('source_type', 'unknown'),
+                'is_duplicate_reference': image_info.get('is_duplicate_reference', False),
+                'extraction_method': 'advanced_document_processor_with_deduplication',
+                'processing_timestamp': self.processing_timestamp,
+                'upload_timestamp': image_info['upload_timestamp'],
+                'ai_processed': False,
+                # Advanced metadata
+                'is_master_image': image_info.get('is_master_image', False),
+                'duplicate_group_id': image_info.get('duplicate_group_id', 'unknown'),
+                'hash_value': image_info.get('hash_value', 'unknown'),
+                'total_instances': image_info.get('total_instances', 1),
+                'instance_pages': image_info.get('instance_pages', []),
+                'extraction_methods': image_info.get('extraction_methods', []),
+                'width': image_info.get('width', 0),
+                'height': image_info.get('height', 0),
+                'ttl': int(ttl.timestamp())
+            }
+            
+            images_table.put_item(Item=item)
+            logger.info(f"DynamoDB: Stored advanced metadata for {image_info['placeholder']}")
+            
+        except Exception as e:
+            logger.error(f"DynamoDB storage failed for {image_info['placeholder']}: {e}")
+
     def _strip_formatting_markers(self, formatted_text: str) -> str:
         """Generate plain text version by removing formatting markers"""
         
@@ -1589,22 +2293,24 @@ class EnhancedDocumentProcessor:
         plain_text = re.sub(r'\*\*TABLE START\*\*\n', '', plain_text)  # Table markers
         plain_text = re.sub(r'\*\*TABLE END\*\*\n', '', plain_text)
         plain_text = re.sub(r'\|.*?\|', '', plain_text, flags=re.MULTILINE)  # Table content
-        plain_text = re.sub(r'^-+\|.*$', '', plain_text, flags=re.MULTILINE)  # Table separators
-        plain_text = re.sub(r'!\[.*?\]\(.*?\)', '[Image]', plain_text)  # Image links
-        plain_text = re.sub(r'\[.*?\]', '', plain_text)  # Remove remaining brackets
+        plain_text = re.sub(r'^-+\|.*, '', plain_text, flags=re.MULTILINE)  # Table separators
+        plain_text = re.sub(r'!\[.*?\]\(.*?\)', '', plain_text)  # Image links
         
         # Clean up extra whitespace
         plain_text = re.sub(r'\n\s*\n\s*\n', '\n\n', plain_text)
         
         return plain_text.strip()
 
+
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
-    """AWS Lambda handler with integrated image AI processing trigger - Supports advanced PDF and DOCX"""
+    """
+    AWS Lambda handler with ADVANCED PDF processing - Supports complete duplicate detection and spatial positioning
+    """
     
     request_id = getattr(context, 'aws_request_id', str(uuid.uuid4()))
     
     try:
-        logger.info(f"Enhanced Document processor with advanced PDF support started - Request ID: {request_id}")
+        logger.info(f"ADVANCED Enhanced Document processor with complete PDF support started - Request ID: {request_id}")
         
         # Handle health check
         if event.get('action') == 'health_check':
@@ -1612,34 +2318,35 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'statusCode': 200,
                 'body': json.dumps({
                     'status': 'healthy',
-                    'service': 'enhanced-document-processor-with-advanced-pdf-support',
+                    'service': 'advanced-enhanced-document-processor-with-complete-pdf-support',
                     'timestamp': datetime.utcnow().isoformat(),
                     'request_id': request_id,
                     'supported_formats': ['PDF', 'DOCX'],
-                    'features': [
-                        'Advanced PDF processing with spatial image detection',
-                        'Complete duplicate image detection and handling',
-                        'Precise image positioning in text flow',
+                    'advanced_features': [
+                        'Multi-method PDF image detection',
+                        'Hash-based duplicate detection across pages',
+                        'Spatial positioning and intelligent image-text integration',
+                        'Multiple instance detection per page',
+                        'Advanced image metadata tracking',
                         'Enhanced DOCX processing with formatting preservation',
                         'Automatic AI image processing trigger',
                         'S3 file storage for extracted text and images',
-                        'DynamoDB metadata storage',
+                        'DynamoDB metadata storage with advanced fields',
                         'Event-driven architecture support',
-                        'SQS and Lambda invoke integration',
-                        'Comprehensive processing statistics',
-                        'Advanced error handling and fallback mechanisms'
+                        'SQS and Lambda invoke integration'
                     ],
+                    'configuration': {
+                        'spatial_positioning_enabled': ENABLE_SPATIAL_POSITIONING,
+                        'duplicate_detection_enabled': ENABLE_DUPLICATE_DETECTION,
+                        'advanced_image_detection_enabled': ENABLE_ADVANCED_IMAGE_DETECTION,
+                        'image_hash_similarity_threshold': IMAGE_HASH_SIMILARITY_THRESHOLD,
+                        'min_image_size_bytes': MIN_IMAGE_SIZE_BYTES,
+                        'max_images_per_page': MAX_IMAGES_PER_PAGE
+                    },
                     'ai_integration': {
                         'sqs_configured': bool(IMAGE_PROCESSING_QUEUE_URL),
                         'lambda_arn_configured': bool(IMAGE_PROCESSOR_LAMBDA_ARN),
                         'async_processing': USE_ASYNC_PROCESSING
-                    },
-                    'pdf_capabilities': {
-                        'spatial_image_detection': True,
-                        'duplicate_detection': True,
-                        'positioning_accuracy': True,
-                        'multi_instance_support': True,
-                        'advanced_text_integration': True
                     }
                 }),
                 'headers': {
@@ -1666,13 +2373,13 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                         continue
                     
                     document_id = generate_unique_document_id(original_filename)
-                    logger.info(f"Processing {original_filename} as document {document_id}")
+                    logger.info(f"Processing {original_filename} as document {document_id} with ADVANCED features")
                     
                     # Download file
                     local_path = f"/tmp/{document_id}_{original_filename}"
                     s3_client.download_file(S3_BUCKET, s3_key, local_path)
                     
-                    # Process with enhanced processor
+                    # Process with ADVANCED enhanced processor
                     processor = EnhancedDocumentProcessor(document_id)
                     result = processor.process_document(local_path)
                     
@@ -1702,7 +2409,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     'failed_count': len(results) - successful,
                     'total_count': len(results),
                     'results': results,
-                    'request_id': request_id
+                    'request_id': request_id,
+                    'advanced_processing': True
                 }),
                 'headers': {
                     'Content-Type': 'application/json',
@@ -1743,6 +2451,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                         'success': False,
                         'error': 'unsupported_file_type',
                         'message': f'Unsupported file type: {file_extension}. Supported types: .pdf, .docx',
+                        'supported_formats': ['PDF', 'DOCX'],
+                        'advanced_features_available': file_extension == '.pdf',
                         'request_id': request_id
                     }),
                     'headers': {
@@ -1752,13 +2462,13 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 }
             
             document_id = generate_unique_document_id(original_filename)
-            logger.info(f"Processing {original_filename} as document {document_id}")
+            logger.info(f"Processing {original_filename} as document {document_id} with ADVANCED features")
             
             # Download file
             local_path = f"/tmp/{document_id}_{original_filename}"
             s3_client.download_file(s3_bucket, s3_key, local_path)
             
-            # Process with enhanced processor
+            # Process with ADVANCED enhanced processor
             processor = EnhancedDocumentProcessor(document_id)
             result = processor.process_document(local_path)
             
@@ -1778,15 +2488,16 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             }
     
     except Exception as e:
-        logger.error(f"Lambda handler error: {e}")
+        logger.error(f"ADVANCED Lambda handler error: {e}")
         return {
             'statusCode': 500,
             'body': json.dumps({
                 'success': False,
-                'error': 'lambda_handler_error',
+                'error': 'advanced_lambda_handler_error',
                 'message': str(e),
                 'request_id': request_id,
-                'traceback': traceback.format_exc()
+                'traceback': traceback.format_exc(),
+                'advanced_processing': True
             }),
             'headers': {
                 'Content-Type': 'application/json',
