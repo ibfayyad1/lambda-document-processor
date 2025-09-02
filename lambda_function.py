@@ -655,14 +655,17 @@ class EnhancedDocumentProcessor:
             logger.warning(f"Multiple instance detection failed for page {page_num}: {e}")
     
     def _identify_duplicates_advanced(self, pdf_doc, all_images: Dict[int, AdvancedImageInfo]) -> Tuple[List[AdvancedImageInfo], Dict[str, List[AdvancedImageInfo]]]:
-        """PHASE 2: Advanced duplicate detection using multiple hashing methods"""
+        """PHASE 2: FIXED Advanced duplicate detection using multiple hashing methods"""
         
-        logger.info("Starting advanced duplicate detection...")
+        logger.info("Starting FIXED advanced duplicate detection...")
         
-        # Extract and hash all images
-        hash_map = {}  # hash -> first image with this hash
-        duplicate_groups = {}  # group_id -> list of images
+        # FIXED: Use content-based hashing instead of xref-based
+        content_hash_map = {}  # content_hash -> first image with this hash
+        duplicate_groups = {}  # group_id -> list of images  
         unique_images = []
+        processed_hashes = set()
+        
+        logger.info(f"Processing {len(all_images)} total image xrefs for duplicate detection...")
         
         for xref, image_info in all_images.items():
             try:
@@ -676,53 +679,65 @@ class EnhancedDocumentProcessor:
                 image_info.image_data = image_data
                 image_info.size_bytes = len(image_data)
                 
-                # Generate multiple hashes for robust duplicate detection
-                hashes = self._generate_image_hashes(image_data)
-                primary_hash = hashes['md5']  # Use MD5 as primary
-                image_info.hash_value = primary_hash
+                # FIXED: Generate content-based hash (not xref-based)
+                content_hash = hashlib.md5(image_data).hexdigest()
+                image_info.hash_value = content_hash
                 
-                # Check for duplicates
-                if primary_hash in hash_map:
-                    # This is a duplicate
-                    master_image = hash_map[primary_hash]
+                logger.debug(f"Image xref={xref}, page={image_info.page_num + 1}, hash={content_hash[:8]}..., size={len(image_data)} bytes")
+                
+                # FIXED: Check for duplicates by content hash
+                if content_hash in content_hash_map:
+                    # This is a duplicate - same content hash as existing image
+                    master_image = content_hash_map[content_hash]
                     image_info.is_duplicate = True
                     image_info.master_image = master_image
                     image_info.duplicate_group_id = master_image.duplicate_group_id
                     
-                    # Add to duplicate group
-                    if master_image.duplicate_group_id in duplicate_groups:
-                        duplicate_groups[master_image.duplicate_group_id].append(image_info)
-                    else:
-                        logger.error(f"Duplicate group {master_image.duplicate_group_id} not found!")
+                    # Add to existing duplicate group
+                    duplicate_groups[master_image.duplicate_group_id].append(image_info)
                     
-                    logger.info(f"Found duplicate: xref={xref} matches xref={master_image.xref} (page {master_image.page_num + 1})")
+                    logger.info(f"🎯 DUPLICATE FOUND: xref={xref} (page {image_info.page_num + 1}) matches xref={master_image.xref} (page {master_image.page_num + 1})")
                     
                 else:
-                    # This is a unique image
+                    # This is a unique image - first time seeing this content
                     image_info.is_duplicate = False
-                    image_info.duplicate_group_id = f"group_{len(duplicate_groups)}"
+                    group_id = f"group_{len(duplicate_groups)}"
+                    image_info.duplicate_group_id = group_id
                     
-                    # Create new group
-                    duplicate_groups[image_info.duplicate_group_id] = [image_info]
-                    hash_map[primary_hash] = image_info
+                    # Create new group with this image as master
+                    duplicate_groups[group_id] = [image_info]
+                    content_hash_map[content_hash] = image_info
                     unique_images.append(image_info)
                     
-                    logger.debug(f"Unique image: xref={xref} on page {image_info.page_num + 1}, size={image_info.size_bytes} bytes")
+                    logger.info(f"✅ UNIQUE IMAGE: xref={xref} on page {image_info.page_num + 1}, hash={content_hash[:8]}...")
+                
+                processed_hashes.add(content_hash)
                 
             except Exception as e:
                 logger.warning(f"Failed to process image xref={xref}: {e}")
                 continue
         
-        logger.info(f"Duplicate detection complete:")
-        logger.info(f"  - Total images processed: {len(all_images)}")
-        logger.info(f"  - Unique images: {len(unique_images)}")
+        # FIXED: Log detailed duplicate detection results
+        logger.info(f"🔍 DUPLICATE DETECTION RESULTS:")
+        logger.info(f"  - Total image xrefs processed: {len(all_images)}")
+        logger.info(f"  - Unique content hashes: {len(processed_hashes)}")
+        logger.info(f"  - Unique images (masters): {len(unique_images)}")
         logger.info(f"  - Duplicate groups: {len(duplicate_groups)}")
         
-        # Log duplicate group details
+        # Log detailed duplicate group information
+        total_instances = 0
+        duplicate_count = 0
+        
         for group_id, group_images in duplicate_groups.items():
+            total_instances += len(group_images)
             if len(group_images) > 1:
+                duplicate_count += len(group_images) - 1  # All except master are duplicates
                 pages = [str(img.page_num + 1) for img in group_images]
-                logger.info(f"  - {group_id}: {len(group_images)} instances on pages {', '.join(pages)}")
+                master_hash = group_images[0].hash_value[:8] if group_images[0].hash_value else "unknown"
+                logger.info(f"  🔄 {group_id}: {len(group_images)} instances on pages {', '.join(pages)} (hash: {master_hash}...)")
+        
+        logger.info(f"  - Total image instances: {total_instances}")
+        logger.info(f"  - Duplicate instances: {duplicate_count}")
         
         return unique_images, duplicate_groups
     
@@ -984,13 +999,13 @@ class EnhancedDocumentProcessor:
     def _process_and_upload_unique_images(self, pdf_doc, formatted_text: str, 
                                         unique_images: List[AdvancedImageInfo], 
                                         duplicate_groups: Dict[str, List[AdvancedImageInfo]]) -> str:
-        """PHASE 5: Process and upload only unique images, update all references"""
+        """PHASE 5: FIXED Process and upload only unique images, update ALL references correctly"""
         
         logger.info(f"Processing and uploading {len(unique_images)} unique images...")
         
         current_text = formatted_text
         
-        # Process each unique image (master of each duplicate group)
+        # FIXED: Process each unique image (master of each duplicate group)
         for unique_image in unique_images:
             try:
                 if not unique_image.image_data:
@@ -1007,6 +1022,9 @@ class EnhancedDocumentProcessor:
                 )
                 
                 if s3_key:
+                    # Get all instances in this duplicate group
+                    group_images = duplicate_groups[unique_image.duplicate_group_id]
+                    
                     # Store image info
                     image_info = {
                         'placeholder': placeholder_name,
@@ -1023,8 +1041,8 @@ class EnhancedDocumentProcessor:
                         'duplicate_group_id': unique_image.duplicate_group_id,
                         'is_master_image': True,
                         'extraction_methods': unique_image.extraction_methods,
-                        'total_instances': len(duplicate_groups[unique_image.duplicate_group_id]),
-                        'instance_pages': [str(img.page_num + 1) for img in duplicate_groups[unique_image.duplicate_group_id]],
+                        'total_instances': len(group_images),
+                        'instance_pages': [str(img.page_num + 1) for img in group_images],
                         'uploaded': True,
                         'upload_timestamp': datetime.utcnow().isoformat(),
                         'source_type': 'pdf'
@@ -1036,20 +1054,26 @@ class EnhancedDocumentProcessor:
                     # Store in DynamoDB
                     self._store_image_metadata(image_info)
                     
-                    # Replace ALL instances of this image across all duplicates
-                    group_images = duplicate_groups[unique_image.duplicate_group_id]
+                    # FIXED: Replace ALL instances of this image across all duplicates
+                    instance_pages = [str(img.page_num + 1) for img in group_images]
+                    instance_info = f"appears on page(s): {', '.join(instance_pages)}"
+                    
+                    placeholder_text = f"\n![{placeholder_name}]({s3_key})\n*PDF Image {self.image_counter} ({instance_info})*\n"
+                    
+                    # FIXED: Replace markers for ALL instances in the group
+                    replaced_count = 0
                     for group_image in group_images:
                         if hasattr(group_image, 'marker') and group_image.marker:
-                            # Create contextual placeholder text
-                            instance_pages = [str(img.page_num + 1) for img in group_images]
-                            instance_info = f"appears on page(s): {', '.join(instance_pages)}"
-                            
-                            placeholder_text = f"\n![{placeholder_name}]({s3_key})\n*PDF Image {self.image_counter} ({instance_info})*\n"
+                            # Count occurrences before replacement
+                            marker_count = current_text.count(group_image.marker)
                             
                             # Replace marker
                             current_text = current_text.replace(group_image.marker, placeholder_text)
+                            replaced_count += marker_count
+                            
+                            logger.debug(f"Replaced marker {group_image.marker} ({marker_count} occurrences) on page {group_image.page_num + 1}")
                     
-                    logger.info(f"Processed unique image {placeholder_name}: {len(group_images)} instances across pages {', '.join([str(img.page_num + 1) for img in group_images])}")
+                    logger.info(f"🎯 Processed unique image {placeholder_name}: {len(group_images)} instances across pages {', '.join(instance_pages)} ({replaced_count} markers replaced)")
                     
                     self.image_counter += 1
                 else:
@@ -1059,13 +1083,16 @@ class EnhancedDocumentProcessor:
                 logger.error(f"Failed to process unique image xref={unique_image.xref}: {e}")
                 continue
         
-        # Clean up any remaining markers
-        current_text = re.sub(r'__IMAGE_PLACEHOLDER_\d+__', '', current_text)
+        # Clean up any remaining markers (fallback)
+        remaining_markers = len(re.findall(r'__IMAGE_PLACEHOLDER_\d+__', current_text))
+        if remaining_markers > 0:
+            logger.warning(f"Found {remaining_markers} unprocessed image markers - cleaning up")
+            current_text = re.sub(r'__IMAGE_PLACEHOLDER_\d+__', '', current_text)
         
         # Clean up extra whitespace while preserving structure
         current_text = re.sub(r'\n\s*\n\s*\n', '\n\n', current_text)
         
-        logger.info(f"Image processing complete: {len(self.processed_images)} unique images uploaded")
+        logger.info(f"✅ Image processing complete: {len(self.processed_images)} unique images uploaded")
         
         return current_text.strip()
     
@@ -2293,7 +2320,7 @@ class EnhancedDocumentProcessor:
         plain_text = re.sub(r'\*\*TABLE START\*\*\n', '', plain_text)  # Table markers
         plain_text = re.sub(r'\*\*TABLE END\*\*\n', '', plain_text)
         plain_text = re.sub(r'\|.*?\|', '', plain_text, flags=re.MULTILINE)  # Table content
-        plain_text = re.sub(r'^-+\|.*$', '', plain_text, flags=re.MULTILINE)  # Table separators
+        plain_text = re.sub(r'^-+\|.*, '', plain_text, flags=re.MULTILINE)  # Table separators
         plain_text = re.sub(r'!\[.*?\]\(.*?\)', '', plain_text)  # Image links
         
         # Clean up extra whitespace
