@@ -8,9 +8,7 @@ import json
 import boto3
 import logging
 import os
-import tempfile
 import base64
-import io
 import time
 import zipfile
 import xml.etree.ElementTree as ET
@@ -19,7 +17,6 @@ import uuid
 import traceback
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
-from decimal import Decimal
 from datetime import datetime, timedelta
 
 # --- PDF support
@@ -51,87 +48,76 @@ lambda_client = boto3.client('lambda')
 sqs_client = boto3.client('sqs')
 events_client = boto3.client('events')
 
-# Initialize DynamoDB tables with better error handling
+# Globals for tables
+text_table = None
+images_table = None
+
+
 def initialize_dynamodb_tables():
     """Initialize DynamoDB tables with proper error handling and logging"""
     global text_table, images_table
-    
-    logger.info(f"Initializing DynamoDB tables...")
+    logger.info("Initializing DynamoDB tables...")
     logger.info(f"Region: {AWS_REGION}")
     logger.info(f"Text table name: {DYNAMODB_TEXT_TABLE}")
     logger.info(f"Images table name: {DYNAMODB_IMAGES_TABLE}")
-    
+
     try:
-        # Initialize text table
         if DYNAMODB_TEXT_TABLE:
             text_table = dynamodb.Table(DYNAMODB_TEXT_TABLE)
-            # Test table access
             text_table.load()
-            logger.info(f"Successfully initialized text table: {DYNAMODB_TEXT_TABLE}")
+            logger.info(f"Initialized text table: {DYNAMODB_TEXT_TABLE}")
         else:
-            logger.error("DYNAMODB_TEXT_TABLE environment variable not set!")
+            logger.error("DYNAMODB_TEXT_TABLE env var not set!")
             text_table = None
-            
     except Exception as e:
-        logger.error(f"Failed to initialize text table: {e}")
+        logger.error(f"Failed to init text table: {e}")
         text_table = None
-    
+
     try:
-        # Initialize images table
         if DYNAMODB_IMAGES_TABLE:
             images_table = dynamodb.Table(DYNAMODB_IMAGES_TABLE)
-            # Test table access
             images_table.load()
-            logger.info(f"Successfully initialized images table: {DYNAMODB_IMAGES_TABLE}")
+            logger.info(f"Initialized images table: {DYNAMODB_IMAGES_TABLE}")
         else:
-            logger.error("DYNAMODB_IMAGES_TABLE environment variable not set!")
+            logger.error("DYNAMODB_IMAGES_TABLE env var not set!")
             images_table = None
-            
     except Exception as e:
-        logger.error(f"Failed to initialize images table: {e}")
+        logger.error(f"Failed to init images table: {e}")
         images_table = None
-    
-    # Log final status
-    if text_table and images_table:
-        logger.info("DynamoDB tables initialized successfully")
-    elif text_table:
-        logger.warning("Only text table initialized - images will be processed but metadata won't be stored")
-    elif images_table:
-        logger.warning("Only images table initialized - text storage will use fallback methods")
-    else:
-        logger.error("No DynamoDB tables initialized - using fallback storage methods only")
 
-# Initialize tables
+    if text_table and images_table:
+        logger.info("All DynamoDB tables ready.")
+    elif text_table:
+        logger.warning("Only text table initialized.")
+    elif images_table:
+        logger.warning("Only images table initialized.")
+    else:
+        logger.error("No DynamoDB tables available.")
+
+
 initialize_dynamodb_tables()
 
 
 def generate_unique_document_id(original_filename: str = None) -> str:
-    """Generate truly unique document ID with timestamp and UUID"""
-    timestamp = datetime.utcnow()
-    microseconds = timestamp.microsecond
-    random_suffix = str(uuid.uuid4())[:8]
-    
-    date_part = timestamp.strftime('%Y%m%d')
-    time_part = timestamp.strftime('%H%M%S')
-    
+    ts = datetime.utcnow()
+    micro = ts.microsecond
+    rand = str(uuid.uuid4())[:8]
+    date_part = ts.strftime('%Y%m%d')
+    time_part = ts.strftime('%H%M%S')
     if original_filename:
-        base_name = Path(original_filename).stem
-        clean_name = re.sub(r'[^\w\-_]', '_', base_name)[:15]
-        document_id = f"{clean_name}_{date_part}_{time_part}_{microseconds}_{random_suffix}"
-    else:
-        document_id = f"doc_{date_part}_{time_part}_{microseconds}_{random_suffix}"
-    
-    logger.info(f"Generated unique document ID: {document_id}")
-    return document_id
+        base = Path(original_filename).stem
+        clean = re.sub(r'[^\w\-_]', '_', base)[:15]
+        return f"{clean}_{date_part}_{time_part}_{micro}_{rand}"
+    return f"doc_{date_part}_{time_part}_{micro}_{rand}"
 
 
 class EnhancedDocumentProcessor:
     """Enhanced processor that preserves document formatting and triggers AI processing"""
-    
+
     def __init__(self, document_id: str):
         self.document_id = document_id
-        self.placeholders = {}
-        self.processed_images = []
+        self.placeholders: Dict[str, str] = {}
+        self.processed_images: List[Dict[str, Any]] = []
         self.image_counter = 1
         self.processing_timestamp = datetime.utcnow().isoformat()
         self.namespaces = {
@@ -139,84 +125,53 @@ class EnhancedDocumentProcessor:
             'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture',
             'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
             'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-            'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing'
+            'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
         }
-        
+
+    # ------------------------ Main entry ------------------------
+
     def process_document(self, file_path: str) -> Dict[str, Any]:
-        """Main processing method with formatting preservation and AI trigger"""
         start_time = time.time()
-        
         try:
-            logger.info(f"Starting enhanced processing for {self.document_id}")
-            
-            # Validate file
+            logger.info(f"Processing {file_path} as {self.document_id}")
+
             if not os.path.exists(file_path):
                 raise Exception(f"File not found: {file_path}")
-            
-            file_size = os.path.getsize(file_path)
-            if file_size > MAX_FILE_SIZE:
-                raise Exception(f"File too large: {file_size} bytes")
-            
-            # Process per file type
+
+            size = os.path.getsize(file_path)
+            if size > MAX_FILE_SIZE:
+                raise Exception(f"File too large: {size} bytes")
+
             if file_path.lower().endswith('.docx'):
                 result = self._process_docx_with_formatting(file_path)
             elif file_path.lower().endswith('.pdf'):
-                result = self._process_pdf_with_pymupdf(file_path)  # NEW: PDF support
+                result = self._process_pdf_with_pymupdf(file_path)
             else:
-                raise Exception(f"Unsupported file type")
-            
-            processing_time = time.time() - start_time
-            
-            # Validate extracted text (keep same behavior as before)
-            if not result.get('formatted_text') or len(result['formatted_text'].strip()) == 0:
-                logger.error("No text was extracted from the document!")
-                raise Exception("Text extraction failed - no content found")
-            
-            logger.info(f"Text extracted successfully: {len(result['formatted_text'])} characters")
-            
-            # Store results with error handling
-            try:
-                # Save text files to S3 as primary storage method
-                text_files_saved = self._save_text_files_to_s3(result['formatted_text'])
-                if text_files_saved:
-                    logger.info("Text files successfully saved to S3")
-                else:
-                    logger.error("Failed to save text files to S3")
-                    
-                # Optional: Also save to DynamoDB if needed
-                if text_table:
-                    try:
-                        self._store_formatted_text(result['formatted_text'])
-                        logger.info("Text also saved to DynamoDB as backup")
-                    except Exception as db_error:
-                        logger.warning(f"DynamoDB backup failed: {db_error}")
-                        
-            except Exception as storage_error:
-                logger.error(f"Text file storage failed: {storage_error}")
-                # Save to local file as last resort
-                self._save_text_to_file(result['formatted_text'])
+                raise Exception("Unsupported file type")
 
-            # TRIGGER IMAGE AI PROCESSING (updated to send per-image metadata)
-            ai_trigger_result = self._trigger_image_ai_processing(
-                result['formatted_text'], 
-                len(self.processed_images)
-            )
-            
-            processing_time = time.time() - start_time
-            
-            logger.info(f"Enhanced processing complete in {processing_time:.2f}s")
-            logger.info(f"Images processed: {len(self.processed_images)}")
-            logger.info(f"AI processing trigger: {ai_trigger_result}")
-            
-            # Create S3 file paths for response
+            if not result.get('formatted_text', '').strip():
+                raise Exception("Text extraction failed - no content found")
+
+            # Save to S3 (formatted/plain/metadata/summary)
+            self._save_text_files_to_s3(result['formatted_text'])
+            # Backup to DynamoDB (optional)
+            if text_table:
+                try:
+                    self._store_formatted_text(result['formatted_text'])
+                except Exception as e:
+                    logger.warning(f"DynamoDB backup failed: {e}")
+
+            # Trigger AI processing
+            ai_trigger = self._trigger_image_ai_processing(result['formatted_text'], len(self.processed_images))
+
+            elapsed = time.time() - start_time
             timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d')
             base_path = f"document_extractions/{timestamp_prefix}/{self.document_id}"
-            
             file_locations = {
                 'formatted_text': f"s3://{S3_BUCKET}/{base_path}/formatted_text.md",
                 'plain_text': f"s3://{S3_BUCKET}/{base_path}/plain_text.txt",
                 'metadata': f"s3://{S3_BUCKET}/{base_path}/metadata.json",
-                'summary': f"s3://{S3_BUCKET}/{base_path}/extraction_summary.txt"
+                'summary': f"s3://{S3_BUCKET}/{base_path}/extraction_summary.txt",
             }
 
             return {
@@ -227,31 +182,30 @@ class EnhancedDocumentProcessor:
                 'plain_text': result.get('plain_text', ''),
                 'images_count': len(self.processed_images),
                 'placeholders': self.placeholders,
-                'processing_time': processing_time,
+                'processing_time': elapsed,
                 'extraction_method': result.get('method', 'enhanced_docx_with_formatting'),
                 'pages_processed': 1,
                 'images_detected': result.get('total_image_references', 0),
                 'unique_image_files': result.get('unique_image_files', 0),
                 'images_extracted': len(self.processed_images),
-                'images_uploaded': len([img for img in self.processed_images if img.get('uploaded')]),
+                'images_uploaded': len([i for i in self.processed_images if i.get('uploaded')]),
                 'tables_detected': result.get('tables_count', 0),
                 'headings_detected': result.get('headings_count', 0),
                 'formatting_preserved': True,
                 'files_saved_to_s3': True,
                 'output_files': file_locations,
                 's3_base_path': f"s3://{S3_BUCKET}/{base_path}/",
-                'placeholder_pdf_s3': result.get('placeholder_pdf_s3'),  # NEW for PDF
-                'ai_processing': ai_trigger_result,  # AI processing trigger info
+                'placeholder_pdf_s3': result.get('placeholder_pdf_s3'),
+                'ai_processing': ai_trigger,
                 'error_count': 0,
                 'warning_count': 0,
                 'errors': [],
-                'warnings': []
+                'warnings': [],
             }
-            
+
         except Exception as e:
-            processing_time = time.time() - start_time
-            logger.error(f"Enhanced processing failed: {e}")
-            
+            elapsed = time.time() - start_time
+            logger.error(f"Processing failed: {e}")
             return {
                 'success': False,
                 'document_id': self.document_id,
@@ -260,7 +214,7 @@ class EnhancedDocumentProcessor:
                 'plain_text': "",
                 'images_count': 0,
                 'placeholders': {},
-                'processing_time': processing_time,
+                'processing_time': elapsed,
                 'extraction_method': 'enhanced_docx_with_formatting',
                 'pages_processed': 0,
                 'images_detected': 0,
@@ -272,11 +226,13 @@ class EnhancedDocumentProcessor:
                 'warning_count': 0,
                 'errors': [str(e)],
                 'warnings': [],
-                'traceback': traceback.format_exc()
+                'traceback': traceback.format_exc(),
             }
-    
+
+    # ------------------------ AI trigger ------------------------
+
     def _trigger_image_ai_processing(self, extracted_text: str, images_count: int) -> Dict[str, Any]:
-        """Trigger AI processing of extracted images – now sends full image metadata."""
+        """Trigger AI processing of extracted images – sends full per-image metadata."""
         if images_count == 0:
             logger.info("No images to process with AI")
             return {'triggered': False, 'reason': 'no_images'}
@@ -287,15 +243,14 @@ class EnhancedDocumentProcessor:
             's3_key': img.get('s3_key'),
             'page_number': img.get('page_number'),
             'sequence_in_page': img.get('sequence_in_page'),
-            'bbox': img.get('bbox'),                 # {x0,y0,x1,y1}
-            'bbox_norm': img.get('bbox_norm'),       # normalized to page size
-            'page_size': img.get('page_size'),       # {width,height}
+            'bbox': img.get('bbox'),
+            'bbox_norm': img.get('bbox_norm'),
+            'page_size': img.get('page_size'),
             'ext': img.get('ext'),
             'original_filename': img.get('original_filename'),
         } for img in self.processed_images]
 
         try:
-            logger.info(f"Triggering AI processing for {images_count} images in document {self.document_id}")
             message_body = {
                 'document_id': self.document_id,
                 'images_count': images_count,
@@ -304,9 +259,8 @@ class EnhancedDocumentProcessor:
                 'images': payload_images,
                 's3_base_path': f"s3://{S3_BUCKET}/document_extractions/{datetime.utcnow().strftime('%Y/%m/%d')}/{self.document_id}/",
                 'trigger_source': 'document_extractor',
-                'text_excerpt_first_2k': extracted_text[:2000] if extracted_text else ""
+                'text_excerpt_first_2k': extracted_text[:2000] if extracted_text else "",
             }
-
             if USE_ASYNC_PROCESSING:
                 if not IMAGE_PROCESSING_QUEUE_URL:
                     logger.warning("IMAGE_PROCESSING_QUEUE_URL not configured")
@@ -317,7 +271,7 @@ class EnhancedDocumentProcessor:
                     MessageAttributes={
                         'DocumentId': {'StringValue': self.document_id, 'DataType': 'String'},
                         'ImagesCount': {'StringValue': str(images_count), 'DataType': 'Number'},
-                        'TriggerSource': {'StringValue': 'document_extractor', 'DataType': 'String'}
+                        'TriggerSource': {'StringValue': 'document_extractor', 'DataType': 'String'},
                     }
                 )
                 return {'triggered': True, 'method': 'sqs', 'message_id': response['MessageId'], 'images_count': images_count}
@@ -333,81 +287,17 @@ class EnhancedDocumentProcessor:
                 return {'triggered': True, 'method': 'lambda_invoke', 'status_code': resp['StatusCode'], 'images_count': images_count}
 
         except Exception as e:
-            logger.error(f"Failed to trigger image AI processing: {e}")
+            logger.error(f"AI trigger failed: {e}")
             return {'triggered': False, 'error': str(e), 'method': 'failed'}
 
-    def _trigger_via_sqs(self, images_count: int) -> Dict[str, Any]:
-        """(Deprecated in favor of unified method above)"""
-        if not IMAGE_PROCESSING_QUEUE_URL:
-            logger.warning("IMAGE_PROCESSING_QUEUE_URL not configured")
-            return {'triggered': False, 'reason': 'sqs_not_configured'}
-        try:
-            # Basic body used previously; kept for backward compatibility if you call it elsewhere
-            message_body = {
-                'document_id': self.document_id,
-                'images_count': images_count,
-                'trigger_source': 'document_extractor',
-                'processing_timestamp': self.processing_timestamp,
-                'trigger_timestamp': datetime.utcnow().isoformat()
-            }
-            response = sqs_client.send_message(
-                QueueUrl=IMAGE_PROCESSING_QUEUE_URL,
-                MessageBody=json.dumps(message_body),
-                MessageAttributes={
-                    'DocumentId': {'StringValue': self.document_id, 'DataType': 'String'},
-                    'ImagesCount': {'StringValue': str(images_count), 'DataType': 'Number'},
-                    'TriggerSource': {'StringValue': 'document_extractor', 'DataType': 'String'}
-                }
-            )
-            logger.info(f"Sent image processing request to SQS: {response['MessageId']}")
-            return {
-                'triggered': True,
-                'method': 'sqs',
-                'message_id': response['MessageId'],
-                'queue_url': IMAGE_PROCESSING_QUEUE_URL,
-                'images_count': images_count
-            }
-        except Exception as e:
-            logger.error(f"SQS trigger failed: {e}")
-            return {'triggered': False, 'error': str(e), 'method': 'sqs'}
-
-    def _trigger_via_lambda_invoke(self, images_count: int) -> Dict[str, Any]:
-        """(Deprecated in favor of unified method above)"""
-        if not IMAGE_PROCESSOR_LAMBDA_ARN:
-            logger.warning("IMAGE_PROCESSOR_LAMBDA_ARN not configured")
-            return {'triggered': False, 'reason': 'lambda_arn_not_configured'}
-        try:
-            payload = {
-                'document_id': self.document_id,
-                'images_count': images_count,
-                'trigger_source': 'document_extractor',
-                'processing_timestamp': self.processing_timestamp
-            }
-            response = lambda_client.invoke(
-                FunctionName=IMAGE_PROCESSOR_LAMBDA_ARN,
-                InvocationType='Event',
-                Payload=json.dumps(payload)
-            )
-            logger.info(f"Triggered image processor Lambda: {response['StatusCode']}")
-            return {
-                'triggered': True,
-                'method': 'lambda_invoke',
-                'status_code': response['StatusCode'],
-                'lambda_arn': IMAGE_PROCESSOR_LAMBDA_ARN,
-                'images_count': images_count
-            }
-        except Exception as e:
-            logger.error(f"Lambda invoke trigger failed: {e}")
-            return {'triggered': False, 'error': str(e), 'method': 'lambda_invoke'}
-
     def _trigger_via_eventbridge(self, images_count: int) -> Dict[str, Any]:
-        """Trigger image processing via EventBridge (alternative option)"""
+        """Alternative trigger via EventBridge (kept for completeness)"""
         try:
             event_detail = {
                 'document_id': self.document_id,
                 'images_count': images_count,
                 'processing_timestamp': self.processing_timestamp,
-                'extraction_complete': True
+                'extraction_complete': True,
             }
             response = events_client.put_events(
                 Entries=[
@@ -415,22 +305,22 @@ class EnhancedDocumentProcessor:
                         'Source': 'document.processor',
                         'DetailType': 'Document Processing Complete',
                         'Detail': json.dumps(event_detail),
-                        'Resources': [f"document:{self.document_id}"]
+                        'Resources': [f"document:{self.document_id}"],
                     }
                 ]
             )
-            logger.info(f"Sent EventBridge event for image processing")
+            logger.info("Sent EventBridge event for image processing")
             return {
                 'triggered': True,
                 'method': 'eventbridge',
                 'event_id': response['Entries'][0].get('EventId'),
-                'images_count': images_count
+                'images_count': images_count,
             }
         except Exception as e:
             logger.error(f"EventBridge trigger failed: {e}")
             return {'triggered': False, 'error': str(e), 'method': 'eventbridge'}
 
-    # ------------------------ PDF PROCESSING (NEW) ------------------------
+    # ------------------------ PDF PROCESSING ------------------------
 
     def _process_pdf_with_pymupdf(self, file_path: str) -> Dict[str, Any]:
         """
@@ -445,12 +335,10 @@ class EnhancedDocumentProcessor:
         if fitz is None:
             raise Exception("PyMuPDF (fitz) not available in this runtime")
 
-        logger.info("Starting enhanced PDF processing with precise image placeholders...")
-
+        logger.info("Starting PDF processing with precise image placeholders...")
         pdf = fitz.open(file_path)
         extracted_plain_parts: List[str] = []
         images_detected_total = 0
-
         placeholder_local_path = f"/tmp/{self.document_id}_placeholders.pdf"
 
         for page_index in range(len(pdf)):
@@ -459,10 +347,10 @@ class EnhancedDocumentProcessor:
             page_rect = page.rect
             page_w, page_h = float(page_rect.width), float(page_rect.height)
 
-            # Extract text (plain) for storage
+            # Extract text (plain)
             extracted_plain_parts.append(page.get_text("text"))
 
-            # Reading-order structured dict to capture images with bbox
+            # Reading-order dict
             p_dict = page.get_text("dict")
             seq_in_page = 0
 
@@ -473,31 +361,29 @@ class EnhancedDocumentProcessor:
 
                     bbox = blk.get("bbox")  # [x0, y0, x1, y1]
                     ext = (blk.get("ext") or "png").lower()
-                    img_bytes = blk.get("image")  # raw bytes
+                    img_bytes = blk.get("image")
 
                     if not img_bytes:
-                        logger.warning("Image bytes missing in dict block; fallback skipped.")
+                        logger.warning("Image bytes missing in dict block; skipping.")
                         continue
 
-                    # Unique placeholder
                     placeholder_name = f"PDFIMG_{self.image_counter}_{int(time.time()*1000)}"
 
-                    # Upload image to S3
                     s3_key = self._upload_image_to_s3_ext(
                         img_bytes, placeholder_name, ext, f"page{page_num}_img{seq_in_page}.{ext}"
                     )
                     if not s3_key:
-                        logger.error(f"Failed S3 upload for {placeholder_name}, skipping redaction/placeholder")
+                        logger.error(f"S3 upload failed for {placeholder_name}, skipping redaction.")
                         continue
 
-                    # Persist image metadata (DDB + local state)
+                    # Metadata
                     img_info = {
                         'placeholder': placeholder_name,
                         's3_key': s3_key,
                         's3_filename': f"{placeholder_name}.{ext}",
                         'original_filename': f"page{page_num}_img{seq_in_page}.{ext}",
                         'image_number': self.image_counter,
-                        'reference_number': images_detected_total - 1,  # global sequence
+                        'reference_number': images_detected_total - 1,
                         'size_bytes': len(img_bytes),
                         'uploaded': True,
                         'upload_timestamp': datetime.utcnow().isoformat(),
@@ -509,41 +395,40 @@ class EnhancedDocumentProcessor:
                         'page_size': {'width': page_w, 'height': page_h},
                         'ext': ext,
                         'extraction_method': 'pdf_pymupdf_blocks',
-                        'processing_timestamp': self.processing_timestamp
+                        'processing_timestamp': self.processing_timestamp,
                     }
                     self.processed_images.append(img_info)
                     self.placeholders[placeholder_name] = s3_key
                     self._store_image_metadata(img_info)
 
-                    # Placeholder via redact annotation on exact rect
+                    # Redaction placeholder with exact rect
                     rect = fitz.Rect(bbox)
-                    ph_text = f"{placeholder_name}"
                     page.add_redact_annot(
                         rect,
-                        text=ph_text,
+                        text=placeholder_name,
                         fill=(0.92, 0.92, 0.92),
                         text_color=(0, 0, 0),
                         fontname="helv",
                         fontsize=9,
-                        align=1
+                        align=1,
                     )
 
                     self.image_counter += 1
 
-            # Apply redactions to remove underlying image pixels
+            # Apply redactions on page
             page.apply_redactions()
 
-        # Save placeholder-preview PDF locally, then upload to S3
+        # Save local placeholder PDF
         pdf.save(placeholder_local_path, garbage=4, deflate=True, clean=True)
         pdf.close()
 
+        # Upload placeholder PDF
         placeholder_pdf_s3_key = self._save_pdf_with_placeholders_to_s3(placeholder_local_path)
 
-        # Extracted text variants
+        # Gather text variants
         plain_text_all = "\n".join(extracted_plain_parts).strip()
         formatted_text = plain_text_all
 
-        # Clean up local temp
         try:
             os.unlink(placeholder_local_path)
         except Exception:
@@ -557,9 +442,9 @@ class EnhancedDocumentProcessor:
             'unique_image_files': images_detected_total,
             'tables_count': 0,
             'headings_count': 0,
-            'placeholder_pdf_s3': f"s3://{S3_BUCKET}/{placeholder_pdf_s3_key}"
+            'placeholder_pdf_s3': f"s3://{S3_BUCKET}/{placeholder_pdf_s3_key}",
         }
-        logger.info(f"Enhanced PDF processing complete. Images: {images_detected_total}.")
+        logger.info(f"PDF processing complete. Images: {images_detected_total}.")
         return result
 
     def _upload_image_to_s3_ext(self, image_data: bytes, placeholder_name: str, ext: str, original_filename: str) -> Optional[str]:
@@ -571,12 +456,11 @@ class EnhancedDocumentProcessor:
             timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d/%H')
             ext = (ext or 'png').lower().strip('.')
             s3_key = f"extracted_images/{timestamp_prefix}/{self.document_id}/{placeholder_name}.{ext}"
-            # Basic content-type inference
             if ext in ('jpg', 'jpeg'):
                 content_type = 'image/jpeg'
             elif ext == 'png':
                 content_type = 'image/png'
-            elif ext == 'tiff' or ext == 'tif':
+            elif ext in ('tiff', 'tif'):
                 content_type = 'image/tiff'
             elif ext == 'bmp':
                 content_type = 'image/bmp'
@@ -584,7 +468,6 @@ class EnhancedDocumentProcessor:
                 content_type = 'image/gif'
             else:
                 content_type = f'image/{ext}'
-
             s3_client.put_object(
                 Bucket=S3_BUCKET,
                 Key=s3_key,
@@ -596,7 +479,7 @@ class EnhancedDocumentProcessor:
                     'original_filename': original_filename,
                     'upload_timestamp': datetime.utcnow().isoformat(),
                     'processing_timestamp': self.processing_timestamp,
-                    'source': 'pdf_pymupdf'
+                    'source': 'pdf_pymupdf',
                 }
             )
             logger.info(f"S3 Upload: {placeholder_name} → s3://{S3_BUCKET}/{s3_key}")
@@ -609,11 +492,9 @@ class EnhancedDocumentProcessor:
         """Upload the placeholder-preview PDF to S3 alongside text artifacts."""
         if not S3_BUCKET:
             raise Exception("S3_BUCKET not configured for PDF upload")
-
         timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d')
         base_path = f"document_extractions/{timestamp_prefix}/{self.document_id}"
         s3_key = f"{base_path}/placeholder_preview.pdf"
-
         with open(local_pdf_path, "rb") as fh:
             s3_client.put_object(
                 Bucket=S3_BUCKET,
@@ -623,39 +504,29 @@ class EnhancedDocumentProcessor:
                 Metadata={
                     'document_id': self.document_id,
                     'processing_timestamp': self.processing_timestamp,
-                    'extraction_method': 'pdf_pymupdf_blocks'
+                    'extraction_method': 'pdf_pymupdf_blocks',
                 }
             )
         logger.info(f"Uploaded placeholder PDF: s3://{S3_BUCKET}/{s3_key}")
         return s3_key
 
-    # ------------------------ DOCX PROCESSING (unchanged) ------------------------
+    # ------------------------ DOCX PROCESSING ------------------------
 
     def _process_docx_with_formatting(self, file_path: str) -> Dict[str, Any]:
-        """Process DOCX while preserving formatting and structure"""
-        logger.info("Starting enhanced DOCX processing with formatting preservation...")
+        logger.info("Starting DOCX processing with formatting preservation...")
         with zipfile.ZipFile(file_path, 'r') as docx_zip:
-            # Extract styles information
             styles_info = self._extract_styles(docx_zip)
-            # Extract numbering information for lists
             numbering_info = self._extract_numbering(docx_zip)
-            # Process document with full formatting
             formatted_text, all_image_references, document_stats = self._extract_formatted_content(
                 docx_zip, styles_info, numbering_info
             )
-            # Get unique image files
             unique_image_files = [f for f in docx_zip.namelist() if f.startswith('word/media/')]
-            logger.info(f"Found {len(all_image_references)} image references")
-            logger.info(f"Found {len(unique_image_files)} unique image files")
-            logger.info(f"Found {document_stats.get('tables_count', 0)} tables")
-            logger.info(f"Found {document_stats.get('headings_count', 0)} headings")
-            # Process all image references
+            logger.info(f"Image references: {len(all_image_references)} | unique files: {len(unique_image_files)}")
             final_text = self._process_all_image_references_formatted(
                 docx_zip, formatted_text, all_image_references, unique_image_files
             )
-            # Generate plain text version
             plain_text = self._strip_formatting_markers(final_text)
-            logger.info("Enhanced DOCX processing complete")
+            logger.info("DOCX processing complete")
             return {
                 'formatted_text': final_text,
                 'plain_text': plain_text,
@@ -663,89 +534,73 @@ class EnhancedDocumentProcessor:
                 'total_image_references': len(all_image_references),
                 'unique_image_files': len(unique_image_files),
                 'tables_count': document_stats.get('tables_count', 0),
-                'headings_count': document_stats.get('headings_count', 0)
+                'headings_count': document_stats.get('headings_count', 0),
             }
-    
+
     def _extract_styles(self, docx_zip: zipfile.ZipFile) -> Dict[str, Dict]:
-        """Extract style definitions from styles.xml"""
-        styles_info = {}
+        styles_info: Dict[str, Dict[str, str]] = {}
         try:
             with docx_zip.open('word/styles.xml') as styles_file:
-                styles_content = styles_file.read().decode('utf-8')
-                styles_root = ET.fromstring(styles_content)
+                styles_root = ET.fromstring(styles_file.read().decode('utf-8'))
                 for style in styles_root.findall('.//w:style', self.namespaces):
-                    style_id = style.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}styleId')
-                    style_type = style.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}type')
+                    sid = style.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}styleId')
+                    stype = style.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}type')
                     name_elem = style.find('.//w:name', self.namespaces)
-                    style_name = name_elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') if name_elem is not None else style_id
-                    styles_info[style_id] = {
-                        'name': style_name,
-                        'type': style_type
-                    }
+                    sname = name_elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val') if name_elem is not None else sid
+                    styles_info[sid] = {'name': sname, 'type': stype}
         except Exception as e:
             logger.warning(f"Could not extract styles: {e}")
         return styles_info
-    
+
     def _extract_numbering(self, docx_zip: zipfile.ZipFile) -> Dict[str, Dict]:
-        """Extract numbering definitions for lists"""
-        numbering_info = {}
+        numbering_info: Dict[str, Dict[str, Dict]] = {}
         try:
             with docx_zip.open('word/numbering.xml') as numbering_file:
-                numbering_content = numbering_file.read().decode('utf-8')
-                numbering_root = ET.fromstring(numbering_content)
+                numbering_root = ET.fromstring(numbering_file.read().decode('utf-8'))
                 for num_def in numbering_root.findall('.//w:num', self.namespaces):
                     num_id = num_def.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numId')
                     numbering_info[num_id] = {'levels': {}}
         except Exception as e:
             logger.warning(f"Could not extract numbering: {e}")
         return numbering_info
-    
-    def _extract_formatted_content(self, docx_zip: zipfile.ZipFile, styles_info: Dict, 
-                                 numbering_info: Dict) -> Tuple[str, List[Dict], Dict]:
-        """Extract document content with full formatting preservation"""
+
+    def _extract_formatted_content(self, docx_zip: zipfile.ZipFile, styles_info: Dict, numbering_info: Dict) -> Tuple[str, List[Dict], Dict]:
         try:
             with docx_zip.open('word/document.xml') as doc_xml:
                 xml_content = doc_xml.read().decode('utf-8')
                 root = ET.fromstring(xml_content)
-                formatted_parts = []
-                all_image_references = []
+                formatted_parts: List[str] = []
+                all_image_references: List[Dict[str, Any]] = []
                 reference_counter = 0
                 document_stats = {'tables_count': 0, 'headings_count': 0}
                 body = root.find('.//w:body', self.namespaces)
                 if body is not None:
                     for element in body:
-                        if element.tag.endswith('}p'):  # Paragraph
-                            para_content, para_images = self._process_paragraph(
-                                element, styles_info, reference_counter
-                            )
+                        if element.tag.endswith('}p'):
+                            para_content, para_images = self._process_paragraph(element, styles_info, reference_counter)
                             if para_content.strip():
                                 formatted_parts.append(para_content)
                                 if self._is_heading_paragraph(element, styles_info):
                                     document_stats['headings_count'] += 1
                             reference_counter += len(para_images)
                             all_image_references.extend(para_images)
-                        elif element.tag.endswith('}tbl'):  # Table
-                            table_content, table_images = self._process_table(
-                                element, styles_info, reference_counter
-                            )
+                        elif element.tag.endswith('}tbl'):
+                            table_content, table_images = self._process_table(element, styles_info, reference_counter)
                             if table_content.strip():
                                 formatted_parts.append(table_content)
                                 document_stats['tables_count'] += 1
                             reference_counter += len(table_images)
                             all_image_references.extend(table_images)
                 formatted_text = '\n\n'.join(formatted_parts)
-                logger.info(f"Extracted {len(formatted_text)} characters with formatting")
-                logger.info(f"Found {len(all_image_references)} image references")
+                logger.info(f"Formatted chars: {len(formatted_text)} | image refs: {len(all_image_references)}")
                 return formatted_text, all_image_references, document_stats
         except Exception as e:
             logger.error(f"Failed to extract formatted content: {e}")
             return self._fallback_formatted_extraction(docx_zip)
-    
-    def _process_paragraph(self, para_elem, styles_info: Dict, 
-                          start_ref_counter: int) -> Tuple[str, List[Dict]]:
-        """Process a paragraph with formatting"""
-        para_parts = []
-        para_images = []
+
+    def _process_paragraph(self, para_elem, styles_info: Dict, start_ref_counter: int) -> Tuple[str, List[Dict]]:
+        para_parts: List[str] = []
+        para_images: List[Dict[str, Any]] = []
         current_ref_counter = start_ref_counter
         para_style = self._get_paragraph_style(para_elem, styles_info)
         para_props = para_elem.find('.//w:pPr', self.namespaces)
@@ -766,63 +621,52 @@ class EnhancedDocumentProcessor:
                 para_images.extend(run_images)
                 current_ref_counter += len(run_images)
         para_text = ''.join(para_parts)
-        formatted_para = self._apply_paragraph_formatting(
-            para_text, para_style, is_list_item, list_level
-        )
+        formatted_para = self._apply_paragraph_formatting(para_text, para_style, is_list_item, list_level)
         return formatted_para, para_images
-    
+
     def _process_run(self, run_elem, start_ref_counter: int) -> Tuple[str, List[Dict]]:
-        """Process a text run with character formatting"""
-        run_parts = []
-        run_images = []
+        run_parts: List[str] = []
+        run_images: List[Dict[str, Any]] = []
         current_ref_counter = start_ref_counter
         run_props = run_elem.find('.//w:rPr', self.namespaces)
         formatting = self._extract_run_formatting(run_props)
         text_elements = run_elem.findall('.//w:t', self.namespaces)
         for text_elem in text_elements:
             if text_elem.text:
-                formatted_text = self._apply_character_formatting(text_elem.text, formatting)
-                run_parts.append(formatted_text)
+                run_parts.append(self._apply_character_formatting(text_elem.text, formatting))
         drawings = run_elem.findall('.//w:drawing', self.namespaces)
         for drawing in drawings:
             pic_elements = drawing.findall('.//pic:pic', self.namespaces)
             for pic in pic_elements:
                 image_marker = f"__IMAGE_PLACEHOLDER_{current_ref_counter}__"
                 image_rel_id = None
-                blip_elements = pic.findall('.//a:blip', self.namespaces)
-                if blip_elements:
-                    image_rel_id = blip_elements[0].get(
-                        '{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed'
-                    )
-                image_ref = {
+                blips = pic.findall('.//a:blip', self.namespaces)
+                if blips:
+                    image_rel_id = blips[0].get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed')
+                run_images.append({
                     'marker': image_marker,
                     'reference_number': current_ref_counter,
                     'relationship_id': image_rel_id,
-                    'context': ''.join(run_parts)[:100]
-                }
-                run_images.append(image_ref)
+                    'context': ''.join(run_parts)[:100],
+                })
                 run_parts.append(f" {image_marker} ")
                 current_ref_counter += 1
         return ''.join(run_parts), run_images
-    
-    def _process_table(self, table_elem, styles_info: Dict, 
-                      start_ref_counter: int) -> Tuple[str, List[Dict]]:
-        """Process a table with formatting"""
-        table_parts = []
-        table_images = []
+
+    def _process_table(self, table_elem, styles_info: Dict, start_ref_counter: int) -> Tuple[str, List[Dict]]:
+        table_parts: List[str] = []
+        table_images: List[Dict[str, Any]] = []
         current_ref_counter = start_ref_counter
         table_parts.append("\n**TABLE START**\n")
         rows = table_elem.findall('.//w:tr', self.namespaces)
         for row_idx, row in enumerate(rows):
-            row_parts = []
+            row_parts: List[str] = []
             cells = row.findall('.//w:tc', self.namespaces)
-            for cell_idx, cell in enumerate(cells):
-                cell_content = []
+            for cell in cells:
+                cell_content: List[str] = []
                 cell_paras = cell.findall('.//w:p', self.namespaces)
                 for para in cell_paras:
-                    para_content, para_images = self._process_paragraph(
-                        para, styles_info, current_ref_counter
-                    )
+                    para_content, para_images = self._process_paragraph(para, styles_info, current_ref_counter)
                     if para_content.strip():
                         cell_content.append(para_content)
                     current_ref_counter += len(para_images)
@@ -832,25 +676,22 @@ class EnhancedDocumentProcessor:
             if row_parts:
                 table_parts.append(''.join(row_parts) + "|\n")
                 if row_idx == 0:
-                    separator = "|" + "---|" * len(cells) + "\n"
-                    table_parts.append(separator)
+                    table_parts.append("|" + ("---|" * len(cells)) + "\n")
         table_parts.append("**TABLE END**\n")
         return ''.join(table_parts), table_images
-    
+
     def _get_paragraph_style(self, para_elem, styles_info: Dict) -> Dict[str, Any]:
-        """Extract paragraph style information"""
-        style_info = {'name': 'Normal', 'type': 'paragraph'}
+        style_info: Dict[str, Any] = {'name': 'Normal', 'type': 'paragraph'}
         para_props = para_elem.find('.//w:pPr', self.namespaces)
         if para_props is not None:
             style_elem = para_props.find('.//w:pStyle', self.namespaces)
             if style_elem is not None:
-                style_id = style_elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val')
-                if style_id in styles_info:
-                    style_info = styles_info[style_id]
+                sid = style_elem.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val')
+                if sid in styles_info:
+                    style_info = styles_info[sid]
         return style_info
-    
+
     def _extract_run_formatting(self, run_props) -> Dict[str, bool]:
-        """Extract character formatting from run properties"""
         formatting = {'bold': False, 'italic': False, 'underline': False}
         if run_props is not None:
             if run_props.find('.//w:b', self.namespaces) is not None:
@@ -860,57 +701,47 @@ class EnhancedDocumentProcessor:
             if run_props.find('.//w:u', self.namespaces) is not None:
                 formatting['underline'] = True
         return formatting
-    
-    def _apply_paragraph_formatting(self, text: str, style_info: Dict, 
-                                  is_list_item: bool, list_level: int) -> str:
-        """Apply paragraph-level formatting"""
+
+    def _apply_paragraph_formatting(self, text: str, style_info: Dict, is_list_item: bool, list_level: int) -> str:
         if not text.strip():
             return text
         style_name = style_info.get('name', '').lower()
         if 'heading' in style_name or 'title' in style_name:
-            heading_level = 1
+            level = 1
             for i in range(1, 7):
                 if f'heading {i}' in style_name or f'heading{i}' in style_name:
-                    heading_level = i
+                    level = i
                     break
-            return f"{'#' * heading_level} {text.strip()}\n"
+            return f"{'#' * level} {text.strip()}\n"
         if is_list_item:
             indent = "  " * list_level
             return f"{indent}- {text.strip()}\n"
         return f"{text.strip()}\n"
-    
+
     def _apply_character_formatting(self, text: str, formatting: Dict[str, bool]) -> str:
-        """Apply character-level formatting"""
         if not text:
             return text
-        formatted_text = text
-        if formatting.get('bold', False):
-            formatted_text = f"**{formatted_text}**"
-        if formatting.get('italic', False):
-            formatted_text = f"*{formatted_text}*"
-        if formatting.get('underline', False):
-            formatted_text = f"<u>{formatted_text}</u>"
-        return formatted_text
-    
+        t = text
+        if formatting.get('bold'):
+            t = f"**{t}**"
+        if formatting.get('italic'):
+            t = f"*{t}*"
+        if formatting.get('underline'):
+            t = f"<u>{t}</u>"
+        return t
+
     def _is_heading_paragraph(self, para_elem, styles_info: Dict) -> bool:
-        """Check if paragraph is a heading"""
         style_info = self._get_paragraph_style(para_elem, styles_info)
-        style_name = style_info.get('name', '').lower()
-        return 'heading' in style_name or 'title' in style_name
-    
-    def _process_all_image_references_formatted(self, docx_zip: zipfile.ZipFile, 
-                                              formatted_text: str, all_image_references: List[Dict], 
-                                              unique_image_files: List[str]) -> str:
-        """Process image references in formatted text"""
+        return 'heading' in style_info.get('name', '').lower() or 'title' in style_info.get('name', '').lower()
+
+    def _process_all_image_references_formatted(self, docx_zip: zipfile.ZipFile, formatted_text: str, all_image_references: List[Dict], unique_image_files: List[str]) -> str:
         current_text = formatted_text
-        sorted_image_files = sorted(unique_image_files, key=lambda x: self._extract_number_from_filename(x))
-        rel_to_file_map = self._build_relationship_mapping(docx_zip, sorted_image_files)
+        sorted_imgs = sorted(unique_image_files, key=lambda x: self._extract_number_from_filename(x))
+        rel_to_file_map = self._build_relationship_mapping(docx_zip, sorted_imgs)
         logger.info(f"Processing {len(all_image_references)} image references...")
         for ref_idx, image_ref in enumerate(all_image_references):
             try:
-                img_file = self._get_image_file_for_reference(
-                    image_ref, sorted_image_files, rel_to_file_map, ref_idx
-                )
+                img_file = self._get_image_file_for_reference(image_ref, sorted_imgs, rel_to_file_map, ref_idx)
                 if not img_file:
                     logger.warning(f"No image file found for reference {ref_idx}")
                     continue
@@ -935,14 +766,12 @@ class EnhancedDocumentProcessor:
                         'upload_timestamp': datetime.utcnow().isoformat(),
                         'is_duplicate_reference': img_file in [img['original_filename'] for img in self.processed_images],
                         'page_number': 1,
-                        'extraction_method': 'enhanced_docx_with_formatting'
+                        'extraction_method': 'enhanced_docx_with_formatting',
                     }
                     self.processed_images.append(image_info)
                     self.placeholders[placeholder_name] = s3_key
                     self._store_image_metadata(image_info)
-                    marker = image_ref['marker']
-                    placeholder_text = f"\n![{placeholder_name}]({s3_key})\n"
-                    current_text = current_text.replace(marker, placeholder_text)
+                    current_text = current_text.replace(image_ref['marker'], f"\n![{placeholder_name}]({s3_key})\n")
                     logger.info(f"Processed {placeholder_name}: ref#{ref_idx} → {img_file}")
                     self.image_counter += 1
                 else:
@@ -953,98 +782,78 @@ class EnhancedDocumentProcessor:
         current_text = re.sub(r'__IMAGE_PLACEHOLDER_\d+__', '', current_text)
         current_text = re.sub(r'\n\s*\n\s*\n', '\n\n', current_text)
         return current_text.strip()
-    
+
     def _strip_formatting_markers(self, formatted_text: str) -> str:
-        """Generate plain text version by removing formatting markers"""
         plain_text = formatted_text
-        plain_text = re.sub(r'\*\*(.*?)\*\*', r'\1', plain_text)
-        plain_text = re.sub(r'\*(.*?)\*', r'\1', plain_text)
-        plain_text = re.sub(r'<u>(.*?)</u>', r'\1', plain_text)
-        plain_text = re.sub(r'^#+\s*', '', plain_text, flags=re.MULTILINE)
-        plain_text = re.sub(r'^\s*-\s*', '', plain_text, flags=re.MULTILINE)
-        plain_text = re.sub(r'\*\*TABLE START\*\*\n', '', plain_text)
+        plain_text = re.sub(r'\*\*(.*?)\*\*', r'\1', plain_text)  # Bold
+        plain_text = re.sub(r'\*(.*?)\*', r'\1', plain_text)      # Italic
+        plain_text = re.sub(r'<u>(.*?)</u>', r'\1', plain_text)   # Underline
+        plain_text = re.sub(r'^#+\s*', '', plain_text, flags=re.MULTILINE)   # Headers
+        plain_text = re.sub(r'^\s*-\s*', '', plain_text, flags=re.MULTILINE) # Lists
+        plain_text = re.sub(r'\*\*TABLE START\*\*\n', '', plain_text)        # Table markers
         plain_text = re.sub(r'\*\*TABLE END\*\*\n', '', plain_text)
-        plain_text = re.sub(r'\|.*?\|', '', plain_text, flags=re.MULTILINE)
-        plain_text = re.sub(r'^-+\|.*$', '', plain_text, flags=re.MULTILINE)
-        plain_text = re.sub(r'\n\s*\n\s*\n', '\n\n', plain_text)
+        plain_text = re.sub(r'\|.*?\|', '', plain_text, flags=re.MULTILINE)  # Table cells
+        plain_text = re.sub(r'^-+\|.*$', '', plain_text, flags=re.MULTILINE) # Table separators (FIXED)
+        plain_text = re.sub(r'\n\s*\n\s*\n', '\n\n', plain_text)             # Collapse extra blanks
         return plain_text.strip()
-    
+
     def _fallback_formatted_extraction(self, docx_zip: zipfile.ZipFile) -> Tuple[str, List[Dict], Dict]:
-        """Fallback extraction that still attempts some formatting"""
         logger.info("Using fallback formatted extraction")
         try:
             with docx_zip.open('word/document.xml') as doc_xml:
                 xml_content = doc_xml.read().decode('utf-8')
                 paragraphs = re.findall(r'<w:p[^>]*>.*?</w:p>', xml_content, re.DOTALL)
-                formatted_parts = []
-                for i, para in enumerate(paragraphs):
-                    text_matches = re.findall(r'<w:t[^>]*>(.*?)</w:t>', para, re.DOTALL)
-                    para_text = ''.join(text_matches).strip()
+                formatted_parts: List[str] = []
+                for para in paragraphs:
+                    texts = re.findall(r'<w:t[^>]*>(.*?)</w:t>', para, re.DOTALL)
+                    para_text = ''.join(texts).strip()
                     if para_text:
                         if re.search(r'<w:b/>', para):
                             para_text = f"**{para_text}**"
                         formatted_parts.append(para_text)
                 formatted_text = '\n\n'.join(formatted_parts)
                 pic_matches = re.findall(r'<pic:pic[^>]*>', xml_content)
-                all_image_references = []
-                for i, pic_match in enumerate(pic_matches):
+                all_refs: List[Dict[str, Any]] = []
+                for i, _ in enumerate(pic_matches):
                     marker = f"__IMAGE_PLACEHOLDER_{i}__"
-                    all_image_references.append({
-                        'marker': marker,
-                        'reference_number': i,
-                        'context': f"Fallback reference {i}",
-                        'fallback': True
-                    })
+                    all_refs.append({'marker': marker, 'reference_number': i, 'context': f"Fallback reference {i}", 'fallback': True})
                     formatted_text += f" {marker} "
-                document_stats = {
-                    'tables_count': len(re.findall(r'<w:tbl>', xml_content)),
-                    'headings_count': 0
-                }
-                return formatted_text, all_image_references, document_stats
+                stats = {'tables_count': len(re.findall(r'<w:tbl>', xml_content)), 'headings_count': 0}
+                return formatted_text, all_refs, stats
         except Exception as e:
             logger.error(f"Fallback formatted extraction failed: {e}")
             return "Failed to extract formatted text", [], {'tables_count': 0, 'headings_count': 0}
-    
+
     def _build_relationship_mapping(self, docx_zip: zipfile.ZipFile, image_files: List[str]) -> Dict[str, str]:
-        """Build mapping from relationship IDs to actual image files"""
-        rel_map = {}
+        rel_map: Dict[str, str] = {}
         try:
             with docx_zip.open('word/_rels/document.xml.rels') as rels_file:
-                rels_content = rels_file.read().decode('utf-8')
-                rels_root = ET.fromstring(rels_content)
-                for relationship in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
-                    rel_id = relationship.get('Id')
-                    target = relationship.get('Target')
-                    rel_type = relationship.get('Type')
-                    if rel_type and 'image' in rel_type.lower() and target:
-                        if target.startswith('media/'):
-                            full_path = f"word/{target}"
-                        else:
-                            full_path = target
+                rels_root = ET.fromstring(rels_file.read().decode('utf-8'))
+                for r in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
+                    rid = r.get('Id')
+                    target = r.get('Target')
+                    rtype = r.get('Type')
+                    if rtype and 'image' in rtype.lower() and target:
+                        full_path = f"word/{target}" if target.startswith('media/') else target
                         if full_path in image_files:
-                            rel_map[rel_id] = full_path
-                            logger.info(f"Mapped relationship {rel_id} → {full_path}")
+                            rel_map[rid] = full_path
+                            logger.info(f"Mapped relationship {rid} → {full_path}")
         except Exception as e:
             logger.warning(f"Could not build relationship mapping: {e}")
         return rel_map
-    
-    def _get_image_file_for_reference(self, image_ref: Dict, image_files: List[str], 
-                                    rel_map: Dict[str, str], ref_idx: int) -> Optional[str]:
-        """Get the correct image file for this specific reference"""
+
+    def _get_image_file_for_reference(self, image_ref: Dict, image_files: List[str], rel_map: Dict[str, str], ref_idx: int) -> Optional[str]:
         if image_ref.get('relationship_id') and image_ref['relationship_id'] in rel_map:
             return rel_map[image_ref['relationship_id']]
         if image_files:
-            file_index = ref_idx % len(image_files)
-            return image_files[file_index]
+            return image_files[ref_idx % len(image_files)]
         return None
-    
+
     def _extract_number_from_filename(self, filename: str) -> int:
-        """Extract number from filename for natural sorting"""
-        numbers = re.findall(r'\d+', filename)
-        return int(numbers[0]) if numbers else 0
-    
+        nums = re.findall(r'\d+', filename)
+        return int(nums[0]) if nums else 0
+
     def _upload_image_to_s3(self, image_data: bytes, placeholder_name: str, original_filename: str) -> Optional[str]:
-        """Upload image to S3 with unique path (PNG default)"""
         if not S3_BUCKET:
             logger.error("S3_BUCKET not configured")
             return None
@@ -1061,7 +870,7 @@ class EnhancedDocumentProcessor:
                     'placeholder_name': placeholder_name,
                     'original_filename': original_filename,
                     'upload_timestamp': datetime.utcnow().isoformat(),
-                    'processing_timestamp': self.processing_timestamp
+                    'processing_timestamp': self.processing_timestamp,
                 }
             )
             logger.info(f"S3 Upload: {placeholder_name} → s3://{S3_BUCKET}/{s3_key}")
@@ -1069,15 +878,14 @@ class EnhancedDocumentProcessor:
         except Exception as e:
             logger.error(f"S3 upload failed for {placeholder_name}: {e}")
             return None
-    
+
     def _store_image_metadata(self, image_info: Dict[str, Any]) -> None:
-        """Store image metadata in DynamoDB"""
         if not images_table:
             logger.warning("Images table not available")
             return
         try:
             ttl = datetime.utcnow() + timedelta(days=30)
-            image_id = f"{self.document_id}_{image_info['reference_number']}_{int(time.time() * 1000)}"
+            image_id = f"{self.document_id}_{image_info.get('reference_number')}_{int(time.time() * 1000)}"
             item = {
                 'document_id': self.document_id,
                 'image_id': image_id,
@@ -1099,15 +907,16 @@ class EnhancedDocumentProcessor:
                 'processing_timestamp': self.processing_timestamp,
                 'upload_timestamp': image_info.get('upload_timestamp'),
                 'ai_processed': False,
-                'ttl': int(ttl.timestamp())
+                'ttl': int(ttl.timestamp()),
             }
             images_table.put_item(Item=item)
-            logger.info(f"DynamoDB: Stored metadata for {image_info['placeholder']}")
+            logger.info(f"DynamoDB: Stored metadata for {image_info.get('placeholder')}")
         except Exception as e:
             logger.error(f"DynamoDB storage failed for {image_info.get('placeholder')}: {e}")
-    
+
+    # ------------------------ Text artifacts to S3 ------------------------
+
     def _save_text_files_to_s3(self, formatted_text: str) -> bool:
-        """Primary method: Save extracted text as files in S3"""
         if not S3_BUCKET:
             logger.error("S3_BUCKET not configured for text file storage")
             return False
@@ -1122,8 +931,9 @@ class EnhancedDocumentProcessor:
                 'character_count': str(len(formatted_text)),
                 'plain_character_count': str(len(plain_text)),
                 'images_processed': str(len(self.processed_images)),
-                'extraction_timestamp': datetime.utcnow().isoformat()
+                'extraction_timestamp': datetime.utcnow().isoformat(),
             }
+            # formatted
             formatted_s3_key = f"{base_path}/formatted_text.md"
             s3_client.put_object(
                 Bucket=S3_BUCKET,
@@ -1133,6 +943,7 @@ class EnhancedDocumentProcessor:
                 Metadata=file_metadata
             )
             logger.info(f"Saved formatted text: s3://{S3_BUCKET}/{formatted_s3_key}")
+            # plain
             plain_s3_key = f"{base_path}/plain_text.txt"
             s3_client.put_object(
                 Bucket=S3_BUCKET,
@@ -1142,6 +953,7 @@ class EnhancedDocumentProcessor:
                 Metadata=file_metadata
             )
             logger.info(f"Saved plain text: s3://{S3_BUCKET}/{plain_s3_key}")
+            # metadata.json
             extraction_metadata = {
                 'document_id': self.document_id,
                 'processing_timestamp': self.processing_timestamp,
@@ -1155,17 +967,16 @@ class EnhancedDocumentProcessor:
                 'file_locations': {
                     'formatted_text': f"s3://{S3_BUCKET}/{formatted_s3_key}",
                     'plain_text': f"s3://{S3_BUCKET}/{plain_s3_key}",
-                    'metadata': f"s3://{S3_BUCKET}/{base_path}/metadata.json"
+                    'metadata': f"s3://{S3_BUCKET}/{base_path}/metadata.json",
                 },
                 'images': [
                     {
                         'placeholder': img.get('placeholder'),
                         's3_location': f"s3://{S3_BUCKET}/{img.get('s3_key')}",
                         'original_filename': img.get('original_filename'),
-                        'size_bytes': img.get('size_bytes')
-                    }
-                    for img in self.processed_images
-                ]
+                        'size_bytes': img.get('size_bytes'),
+                    } for img in self.processed_images
+                ],
             }
             metadata_s3_key = f"{base_path}/metadata.json"
             s3_client.put_object(
@@ -1176,6 +987,7 @@ class EnhancedDocumentProcessor:
                 Metadata=file_metadata
             )
             logger.info(f"Saved metadata: s3://{S3_BUCKET}/{metadata_s3_key}")
+            # summary
             summary_report = self._generate_summary_report(formatted_text, plain_text, extraction_metadata)
             summary_s3_key = f"{base_path}/extraction_summary.txt"
             s3_client.put_object(
@@ -1185,16 +997,14 @@ class EnhancedDocumentProcessor:
                 ContentType='text/plain; charset=utf-8',
                 Metadata=file_metadata
             )
-
             logger.info(f"Saved summary: s3://{S3_BUCKET}/{summary_s3_key}")
             return True
         except Exception as e:
             logger.error(f"Failed to save text files to S3: {e}")
             return False
-    
+
     def _generate_summary_report(self, formatted_text: str, plain_text: str, metadata: dict) -> str:
-        """Generate a human-readable summary report"""
-        report_lines = [
+        report_lines: List[str] = [
             "=" * 60,
             "DOCUMENT EXTRACTION SUMMARY REPORT",
             "=" * 60,
@@ -1228,17 +1038,16 @@ class EnhancedDocumentProcessor:
             "",
             "=" * 60,
             "END OF SUMMARY REPORT",
-            "=" * 60
+            "=" * 60,
         ])
         return "\n".join(report_lines)
-    
+
+    # ------------------------ Text backup to /tmp ------------------------
+
     def _store_formatted_text(self, formatted_text: str) -> bool:
-        """Store formatted text in DynamoDB with robust error handling"""
-        logger.info(f"Attempting to store text for document {self.document_id}")
-        logger.info(f"Text length: {len(formatted_text)} characters")
+        logger.info(f"Storing text for document {self.document_id}")
         if not text_table:
             logger.error("DynamoDB text table not initialized!")
-            logger.error(f"DYNAMODB_TEXT_TABLE environment variable: {DYNAMODB_TEXT_TABLE}")
             self._save_text_to_file(formatted_text)
             return False
         try:
@@ -1257,35 +1066,32 @@ class EnhancedDocumentProcessor:
                 'pages_processed': 1,
                 'images_processed': len(self.processed_images),
                 'placeholders': self.placeholders,
-                'ttl': int(ttl.timestamp())
+                'ttl': int(ttl.timestamp()),
             }
-            logger.info(f"Attempting DynamoDB put_item for document {self.document_id}")
-            response = text_table.put_item(Item=item)
-            logger.info(f"DynamoDB: Successfully stored formatted text for document {self.document_id}")
-            self._save_text_to_file(formatted_text)
+            text_table.put_item(Item=item)
+            logger.info(f"DynamoDB: stored text for {self.document_id}")
+            self._save_text_to_file(formatted_text)  # backup copy locally
             return True
         except Exception as e:
             logger.error(f"DynamoDB text storage failed: {e}")
-            logger.error(f"Exception type: {type(e).__name__}")
-            logger.error(f"Exception details: {str(e)}")
             self._save_text_to_file(formatted_text)
             raise e
-    
+
     def _save_text_to_file(self, formatted_text: str) -> None:
-        """Fallback: Save text to local file for debugging"""
         try:
             formatted_file_path = f"/tmp/{self.document_id}_formatted.txt"
             with open(formatted_file_path, 'w', encoding='utf-8') as f:
                 f.write(formatted_text)
-            logger.info(f"Backup: Saved formatted text to {formatted_file_path}")
             plain_text = self._strip_formatting_markers(formatted_text)
             plain_file_path = f"/tmp/{self.document_id}_plain.txt"
             with open(plain_file_path, 'w', encoding='utf-8') as f:
                 f.write(plain_text)
-            logger.info(f"Backup: Saved plain text to {plain_file_path}")
+            logger.info(f"Backups saved: {formatted_file_path}, {plain_file_path}")
         except Exception as e:
-            logger.error(f"Failed to save backup text files: {e}")
+            logger.error(f"Failed to save backup files: {e}")
 
+
+# ------------------------ Lambda Handler ------------------------
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
@@ -1293,7 +1099,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
     request_id = getattr(context, 'aws_request_id', str(uuid.uuid4()))
     try:
-        logger.info(f"Enhanced Document processor with AI integration started - Request ID: {request_id}")
+        logger.info(f"Document processor started - Request ID: {request_id}")
+
         # Health check
         if event.get('action') == 'health_check':
             return {
@@ -1310,19 +1117,20 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                         'S3 file storage for extracted text and PDFs',
                         'DynamoDB metadata storage',
                         'Event-driven architecture support',
-                        'SQS and Lambda invoke integration'
+                        'SQS and Lambda invoke integration',
                     ],
                     'ai_integration': {
                         'sqs_configured': bool(IMAGE_PROCESSING_QUEUE_URL),
                         'lambda_arn_configured': bool(IMAGE_PROCESSOR_LAMBDA_ARN),
-                        'async_processing': USE_ASYNC_PROCESSING
+                        'async_processing': USE_ASYNC_PROCESSING,
                     }
                 }),
                 'headers': {'Content-Type': 'application/json', 'X-Request-ID': request_id}
             }
+
         # SQS batch
         if 'Records' in event and event['Records']:
-            results = []
+            results: List[Dict[str, Any]] = []
             for record in event['Records']:
                 try:
                     message_body = json.loads(record['body'])
@@ -1330,7 +1138,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     s3_key = file_info['key']
                     original_filename = Path(s3_key).name
                     document_id = generate_unique_document_id(original_filename)
-                    logger.info(f"Processing {original_filename} as document {document_id}")
+                    logger.info(f"SQS → processing {original_filename} as {document_id}")
                     local_path = f"/tmp/{document_id}_{original_filename}"
                     s3_client.download_file(S3_BUCKET, s3_key, local_path)
                     processor = EnhancedDocumentProcessor(document_id)
@@ -1342,12 +1150,8 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                         pass
                 except Exception as e:
                     logger.error(f"Failed to process SQS record: {e}")
-                    results.append({
-                        'success': False,
-                        'error': str(e),
-                        'traceback': traceback.format_exc()
-                    })
-            successful = len([r for r in results if r.get('success', False)])
+                    results.append({'success': False, 'error': str(e), 'traceback': traceback.format_exc()})
+            successful = len([r for r in results if r.get('success')])
             return {
                 'statusCode': 200 if successful > 0 else 400,
                 'body': json.dumps({
@@ -1356,43 +1160,44 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     'failed_count': len(results) - successful,
                     'total_count': len(results),
                     'results': results,
-                    'request_id': request_id
+                    'request_id': request_id,
                 }),
                 'headers': {'Content-Type': 'application/json', 'X-Request-ID': request_id}
             }
+
         # Direct invocation
-        else:
-            s3_key = event.get('s3_key') or event.get('key')
-            s3_bucket = event.get('s3_bucket') or S3_BUCKET
-            original_filename = event.get('original_filename')
-            if not s3_bucket or not s3_key:
-                return {
-                    'statusCode': 400,
-                    'body': json.dumps({
-                        'success': False,
-                        'error': 'missing_parameters',
-                        'message': 'Required parameters: s3_bucket, s3_key',
-                        'request_id': request_id
-                    }),
-                    'headers': {'Content-Type': 'application/json', 'X-Request-ID': request_id}
-                }
-            if not original_filename:
-                original_filename = Path(s3_key).name
-            document_id = generate_unique_document_id(original_filename)
-            logger.info(f"Processing {original_filename} as document {document_id}")
-            local_path = f"/tmp/{document_id}_{original_filename}"
-            s3_client.download_file(s3_bucket, s3_key, local_path)
-            processor = EnhancedDocumentProcessor(document_id)
-            result = processor.process_document(local_path)
-            try:
-                os.unlink(local_path)
-            except Exception:
-                pass
+        s3_key = event.get('s3_key') or event.get('key')
+        s3_bucket = event.get('s3_bucket') or S3_BUCKET
+        original_filename = event.get('original_filename')
+        if not s3_bucket or not s3_key:
             return {
-                'statusCode': 200 if result['success'] else 500,
-                'body': json.dumps(result),
+                'statusCode': 400,
+                'body': json.dumps({
+                    'success': False,
+                    'error': 'missing_parameters',
+                    'message': 'Required parameters: s3_bucket, s3_key',
+                    'request_id': request_id,
+                }),
                 'headers': {'Content-Type': 'application/json', 'X-Request-ID': request_id}
             }
+        if not original_filename:
+            original_filename = Path(s3_key).name
+        document_id = generate_unique_document_id(original_filename)
+        logger.info(f"Direct → processing {original_filename} as {document_id}")
+        local_path = f"/tmp/{document_id}_{original_filename}"
+        s3_client.download_file(s3_bucket, s3_key, local_path)
+        processor = EnhancedDocumentProcessor(document_id)
+        result = processor.process_document(local_path)
+        try:
+            os.unlink(local_path)
+        except Exception:
+            pass
+        return {
+            'statusCode': 200 if result['success'] else 500,
+            'body': json.dumps(result),
+            'headers': {'Content-Type': 'application/json', 'X-Request-ID': request_id}
+        }
+
     except Exception as e:
         logger.error(f"Lambda handler error: {e}")
         return {
@@ -1402,7 +1207,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'error': 'lambda_handler_error',
                 'message': str(e),
                 'request_id': request_id,
-                'traceback': traceback.format_exc()
+                'traceback': traceback.format_exc(),
             }),
             'headers': {'Content-Type': 'application/json', 'X-Request-ID': request_id}
         }
