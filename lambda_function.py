@@ -1183,9 +1183,9 @@ class EnhancedDocumentProcessor:
                 Key=summary_s3_key,
                 Body=summary_report.encode('utf-8'),
                 ContentType='text/plain; charset=utf-8',
-                Metadata[file_metadata
-                ]
+                Metadata=file_metadata
             )
+
             logger.info(f"Saved summary: s3://{S3_BUCKET}/{summary_s3_key}")
             return True
         except Exception as e:
