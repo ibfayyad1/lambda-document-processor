@@ -1,7 +1,10 @@
 """
-Complete Integrated Document Processor with Auto AI Image Processing
-Extracts text/images from DOCX files and automatically triggers AI analysis
-(Updated: PDF now emits INLINE placeholders in formatted_text, no redactions)
+Complete Integrated Document Processor with Auto AI Image Processing (Unified DOCX + PDF)
+- Preserves existing DOCX XML logic (unchanged)
+- Adds PDF inline placeholders in reading order (like DOCX markers)
+- Stores image metadata in DynamoDB with keys: (document_id [PK], image_number [SK])
+- Triggers AI via a single SQS message per document: { document_id, images_count, ... }
+- Saves extracted artifacts to S3 (formatted_text.md, plain_text.txt, metadata.json, summary)
 """
 
 import json
@@ -38,15 +41,20 @@ MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', '104857600'))  # 100MB
 
 # Image AI Processing Configuration
 IMAGE_PROCESSOR_LAMBDA_ARN = os.environ.get('IMAGE_PROCESSOR_LAMBDA_ARN')
-IMAGE_PROCESSING_QUEUE_URL = os.environ.get('IMAGE_BATCH_QUEUE_URL') or os.environ.get('IMAGE_PROCESSING_QUEUE_URL')
+IMAGE_PROCESSING_QUEUE_URL = os.environ.get('IMAGE_PROCESSING_QUEUE_URL') or os.environ.get('IMAGE_BATCH_QUEUE_URL')
 USE_ASYNC_PROCESSING = os.environ.get('USE_ASYNC_PROCESSING', 'true').lower() == 'true'
 
 # AWS Clients
-s3_client = boto3.client('s3')
-dynamodb = boto3.resource('dynamodb')
-lambda_client = boto3.client('lambda')
-sqs_client = boto3.client('sqs')
-events_client = boto3.client('events')
+config = boto3.session.Config(
+    region_name=AWS_REGION,
+    retries={'max_attempts': 3, 'mode': 'standard'},
+    max_pool_connections=50
+)
+s3_client = boto3.client('s3', config=config)
+dynamodb = boto3.resource('dynamodb', config=config)
+lambda_client = boto3.client('lambda', config=config)
+sqs_client = boto3.client('sqs', config=config)
+events_client = boto3.client('events', config=config)
 
 # Globals for tables
 text_table = None
@@ -112,7 +120,7 @@ def generate_unique_document_id(original_filename: str = None) -> str:
 
 
 class EnhancedDocumentProcessor:
-    """Enhanced processor that preserves document formatting and triggers AI processing"""
+    """Unified processor: DOCX (XML logic preserved) + PDF (inline placeholders + SQS trigger)"""
 
     def __init__(self, document_id: str):
         self.document_id = document_id
@@ -145,7 +153,7 @@ class EnhancedDocumentProcessor:
             if file_path.lower().endswith('.docx'):
                 result = self._process_docx_with_formatting(file_path)
             elif file_path.lower().endswith('.pdf'):
-                result = self._process_pdf_with_pymupdf_inline(file_path)  # <<< UPDATED
+                result = self._process_pdf_with_inline_placeholders(file_path)
             else:
                 raise Exception("Unsupported file type")
 
@@ -154,7 +162,6 @@ class EnhancedDocumentProcessor:
 
             # Save to S3 (formatted/plain/metadata/summary)
             self._save_text_files_to_s3(result['formatted_text'])
-
             # Backup to DynamoDB (optional)
             if text_table:
                 try:
@@ -162,8 +169,8 @@ class EnhancedDocumentProcessor:
                 except Exception as e:
                     logger.warning(f"DynamoDB backup failed: {e}")
 
-            # Trigger AI processing for images
-            ai_trigger = self._trigger_image_ai_processing(result['formatted_text'], len(self.processed_images))
+            # Trigger AI processing (single SQS message per document)
+            ai_trigger = self._trigger_image_ai_processing(len(self.processed_images))
 
             elapsed = time.time() - start_time
             timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d')
@@ -196,7 +203,7 @@ class EnhancedDocumentProcessor:
                 'files_saved_to_s3': True,
                 'output_files': file_locations,
                 's3_base_path': f"s3://{S3_BUCKET}/{base_path}/",
-                'placeholder_pdf_s3': result.get('placeholder_pdf_s3'),  # will be None for inline flow
+                'placeholder_pdf_s3': result.get('placeholder_pdf_s3'),
                 'ai_processing': ai_trigger,
                 'error_count': 0,
                 'warning_count': 0,
@@ -230,43 +237,29 @@ class EnhancedDocumentProcessor:
                 'traceback': traceback.format_exc(),
             }
 
-    # ------------------------ AI trigger ------------------------
+    # ------------------------ AI trigger (document-level) ------------------------
 
-    def _trigger_image_ai_processing(self, extracted_text: str, images_count: int) -> Dict[str, Any]:
-        """Trigger AI processing of extracted images – sends full per-image metadata."""
+    def _trigger_image_ai_processing(self, images_count: int) -> Dict[str, Any]:
+        """
+        Trigger AI processing at document level (preferred for your image-processor):
+        - Sends ONE SQS message with document_id, images_count
+        - The image-processor queries DynamoDB for all unprocessed images for this document
+        """
         if images_count == 0:
             logger.info("No images to process with AI")
             return {'triggered': False, 'reason': 'no_images'}
 
-        payload_images = [{
-            'placeholder': img.get('placeholder'),
-            's3_bucket': S3_BUCKET,
-            's3_key': img.get('s3_key'),
-            'page_number': img.get('page_number'),
-            'sequence_in_page': img.get('sequence_in_page'),
-            'bbox': img.get('bbox'),
-            'bbox_norm': img.get('bbox_norm'),
-            'page_size': img.get('page_size'),
-            'ext': img.get('ext'),
-            'original_filename': img.get('original_filename'),
-        } for img in self.processed_images]
+        message_body = {
+            'document_id': self.document_id,
+            'images_count': images_count,
+            'processing_timestamp': self.processing_timestamp,
+            'trigger_timestamp': datetime.utcnow().isoformat(),
+            'trigger_source': 'document_extractor'
+        }
 
         try:
-            message_body = {
-                'document_id': self.document_id,
-                'images_count': images_count,
-                'processing_timestamp': self.processing_timestamp,
-                'trigger_timestamp': datetime.utcnow().isoformat(),
-                'images': payload_images,
-                's3_base_path': f"s3://{S3_BUCKET}/document_extractions/{datetime.utcnow().strftime('%Y/%m/%d')}/{self.document_id}/",
-                'trigger_source': 'document_extractor',
-                'text_excerpt_first_2k': extracted_text[:2000] if extracted_text else "",
-            }
-            if USE_ASYNC_PROCESSING:
-                if not IMAGE_PROCESSING_QUEUE_URL:
-                    logger.warning("IMAGE_PROCESSING_QUEUE_URL not configured")
-                    return {'triggered': False, 'reason': 'sqs_not_configured'}
-                response = sqs_client.send_message(
+            if USE_ASYNC_PROCESSING and IMAGE_PROCESSING_QUEUE_URL:
+                resp = sqs_client.send_message(
                     QueueUrl=IMAGE_PROCESSING_QUEUE_URL,
                     MessageBody=json.dumps(message_body),
                     MessageAttributes={
@@ -275,140 +268,94 @@ class EnhancedDocumentProcessor:
                         'TriggerSource': {'StringValue': 'document_extractor', 'DataType': 'String'},
                     }
                 )
-                return {'triggered': True, 'method': 'sqs', 'message_id': response['MessageId'], 'images_count': images_count}
-            else:
-                if not IMAGE_PROCESSOR_LAMBDA_ARN:
-                    logger.warning("IMAGE_PROCESSOR_LAMBDA_ARN not configured")
-                    return {'triggered': False, 'reason': 'lambda_arn_not_configured'}
+                logger.info(f"SQS trigger → {IMAGE_PROCESSING_QUEUE_URL} : {resp.get('MessageId')}")
+                return {'triggered': True, 'method': 'sqs', 'message_id': resp.get('MessageId'), 'images_count': images_count}
+            elif IMAGE_PROCESSOR_LAMBDA_ARN:
                 resp = lambda_client.invoke(
                     FunctionName=IMAGE_PROCESSOR_LAMBDA_ARN,
                     InvocationType='Event',
                     Payload=json.dumps(message_body)
                 )
-                return {'triggered': True, 'method': 'lambda_invoke', 'status_code': resp['StatusCode'], 'images_count': images_count}
+                logger.info(f"Lambda invoke trigger → {IMAGE_PROCESSOR_LAMBDA_ARN} : {resp.get('StatusCode')}")
+                return {'triggered': True, 'method': 'lambda_invoke', 'status_code': resp.get('StatusCode'), 'images_count': images_count}
+            else:
+                logger.warning("No SQS queue or Lambda ARN configured to trigger AI processing")
+                return {'triggered': False, 'reason': 'no_trigger_configured', 'images_count': images_count}
 
         except Exception as e:
             logger.error(f"AI trigger failed: {e}")
             return {'triggered': False, 'error': str(e), 'method': 'failed'}
 
-    def _trigger_via_eventbridge(self, images_count: int) -> Dict[str, Any]:
-        """Alternative trigger via EventBridge (kept for completeness)"""
-        try:
-            event_detail = {
-                'document_id': self.document_id,
-                'images_count': images_count,
-                'processing_timestamp': self.processing_timestamp,
-                'extraction_complete': True,
-            }
-            response = events_client.put_events(
-                Entries=[
-                    {
-                        'Source': 'document.processor',
-                        'DetailType': 'Document Processing Complete',
-                        'Detail': json.dumps(event_detail),
-                        'Resources': [f"document:{self.document_id}"],
-                    }
-                ]
-            )
-            logger.info("Sent EventBridge event for image processing")
-            return {
-                'triggered': True,
-                'method': 'eventbridge',
-                'event_id': response['Entries'][0].get('EventId'),
-                'images_count': images_count,
-            }
-        except Exception as e:
-            logger.error(f"EventBridge trigger failed: {e}")
-            return {'triggered': False, 'error': str(e), 'method': 'eventbridge'}
+    # ------------------------ PDF PROCESSING (inline placeholders) ------------------------
 
-    # ------------------------ PDF PROCESSING (INLINE PLACEHOLDERS) ------------------------
-
-    def _process_pdf_with_pymupdf_inline(self, file_path: str) -> Dict[str, Any]:
+    def _process_pdf_with_inline_placeholders(self, file_path: str) -> Dict[str, Any]:
         """
-        Process PDF with PyMuPDF using reading-order dict and emit INLINE placeholders:
-          - Iterate blocks in reading order (text/image)
-          - On text blocks: append text to formatted_text
-          - On image blocks: extract bytes, upload to S3, store metadata, and append inline placeholder
-          - No redactions / no watermark PDF generated
-          - Extract plain text from the same concatenated stream (without formatting marks)
+        PDF pipeline (unified with DOCX workflow):
+          - Iterate blocks in reading order
+          - For image blocks: upload to S3, store metadata in DynamoDB (document_id + image_number), add inline placeholder to text
+          - For text blocks: append text as-is
+          - (Optional) produce a placeholder-preview PDF (redactions) and upload to S3
+          - Return formatted_text that contains placeholders so reconstructor can replace with AI results at the exact spots
         """
         if fitz is None:
             raise Exception("PyMuPDF (fitz) not available in this runtime")
 
-        logger.info("Starting PDF processing with INLINE placeholders (no redactions)...")
+        logger.info("Starting PDF processing with inline placeholders...")
         pdf = fitz.open(file_path)
+        pages_processed = len(pdf)
 
-        parts_formatted: List[str] = []
-        parts_plain: List[str] = []
+        formatted_doc_parts: List[str] = []
         images_detected_total = 0
 
+        # Build text by reading blocks in order and inserting placeholders inline
         for page_index in range(len(pdf)):
             page = pdf[page_index]
             page_num = page_index + 1
             page_rect = page.rect
             page_w, page_h = float(page_rect.width), float(page_rect.height)
 
-            # Reading-order dict
             p_dict = page.get_text("dict")
+            page_parts: List[str] = []
+
             seq_in_page = 0
-
-            # We also want plain text of the page (once)
-            page_plain_text = page.get_text("text") or ""
-            # We'll rebuild formatted text by walking blocks,
-            # so we don't add page_plain_text directly to formatted parts (to avoid duplication).
-            # Instead, we push text blocks as they appear below.
-
             for blk in p_dict.get("blocks", []):
                 btype = blk.get("type")
                 if btype == 0:
-                    # Text block: append as-is to formatted and plain
-                    text_spans = []
-                    for line in blk.get("lines", []):
-                        for span in line.get("spans", []):
-                            if span.get("text"):
-                                text_spans.append(span["text"])
-                    text_block = "\n".join([t for t in text_spans if t is not None]).strip()
-                    if text_block:
-                        parts_formatted.append(text_block)
-                        parts_plain.append(text_block)
+                    # text block
+                    text = blk.get("text", "")
+                    if text:
+                        page_parts.append(text.rstrip())
                 elif btype == 1:
-                    # Image block
+                    # image block
                     seq_in_page += 1
                     images_detected_total += 1
 
                     bbox = blk.get("bbox")  # [x0, y0, x1, y1]
                     ext = (blk.get("ext") or "png").lower()
                     img_bytes = blk.get("image")
-
                     if not img_bytes:
-                        # Sometimes dict block doesn't carry raw bytes; fallback via xref
-                        try:
-                            # Approximate: get first image from page matching bbox
-                            # If not available, skip gracefully.
-                            # (PyMuPDF newer versions include 'image' already in dict.)
-                            logger.warning("Image bytes missing in dict block; attempting fallback xref extract")
-                            # Fallback disabled to avoid complex heuristics; skip if no bytes.
-                            continue
-                        except Exception as _:
-                            logger.warning("Fallback image extraction failed; skipping block")
-                            continue
-
-                    # Upload image to S3
-                    placeholder_name = f"PDFIMG_{self.image_counter}_{int(time.time()*1000)}"
-                    s3_key = self._upload_image_to_s3_ext(
-                        img_bytes, placeholder_name, ext, f"page{page_num}_img{seq_in_page}.{ext}"
-                    )
-                    if not s3_key:
-                        logger.error(f"S3 upload failed for {placeholder_name}, skipping placeholder insertion.")
+                        logger.warning("Image bytes missing in dict block; skipping.")
                         continue
 
-                    # Save metadata (DynamoDB)
+                    # Create DOCX-like placeholder naming & numbering
+                    placeholder_name = f"IMAGE_{self.image_counter}_{int(time.time()*1000)}"
+                    s3_key = self._upload_image_to_s3_ext(
+                        img_bytes,
+                        placeholder_name,
+                        ext,
+                        f"page{page_num}_img{seq_in_page}.{ext}"
+                    )
+                    if not s3_key:
+                        logger.error(f"S3 upload failed for {placeholder_name}, skipping placeholder/text insertion.")
+                        continue
+
+                    # Build image_info aligned with DOCX schema (most important!)
                     img_info = {
                         'placeholder': placeholder_name,
                         's3_key': s3_key,
                         's3_filename': f"{placeholder_name}.{ext}",
                         'original_filename': f"page{page_num}_img{seq_in_page}.{ext}",
-                        'image_number': self.image_counter,
+                        'image_number': self.image_counter,  # ← used as SK in images table
                         'reference_number': images_detected_total - 1,
                         'size_bytes': len(img_bytes),
                         'uploaded': True,
@@ -416,54 +363,89 @@ class EnhancedDocumentProcessor:
                         'is_duplicate_reference': False,
                         'page_number': page_num,
                         'sequence_in_page': seq_in_page,
-                        'bbox': {'x0': bbox[0], 'y0': bbox[1], 'x1': bbox[2], 'y1': bbox[3]} if bbox else None,
-                        'bbox_norm': {'x0': bbox[0]/page_w, 'y0': bbox[1]/page_h, 'x1': bbox[2]/page_w, 'y1': bbox[3]/page_h} if bbox else None,
+                        'bbox': {'x0': bbox[0], 'y0': bbox[1], 'x1': bbox[2], 'y1': bbox[3]},
+                        'bbox_norm': {'x0': bbox[0]/page_w, 'y0': bbox[1]/page_h, 'x1': bbox[2]/page_w, 'y1': bbox[3]/page_h},
                         'page_size': {'width': page_w, 'height': page_h},
                         'ext': ext,
-                        'extraction_method': 'pdf_pymupdf_inline_placeholders',
+                        'extraction_method': 'pdf_pymupdf_blocks',
                         'processing_timestamp': self.processing_timestamp,
+                        'ai_processed': False
                     }
+
+                    # Store metadata in-memory + DynamoDB (with correct keys)
                     self.processed_images.append(img_info)
                     self.placeholders[placeholder_name] = s3_key
                     self._store_image_metadata(img_info)
 
-                    # Append INLINE placeholder to formatted text
-                    # We use a consistent markdown-like marker identical to DOCX flow:
-                    # The reconstructor will replace one of these patterns: ![PLACEHOLDER] | __PLACEHOLDER__ | [PLACEHOLDER]
-                    parts_formatted.append(f"\n![{placeholder_name}]()\n")
-                    parts_plain.append(f"\n[{placeholder_name}]\n")
+                    # Insert inline placeholder in the formatted text (DOCX-like)
+                    page_parts.append(f"\n![{placeholder_name}]()\n")
 
                     self.image_counter += 1
-                else:
-                    # Other block types (vector, etc.) -> ignore for now
-                    continue
+                # ignore other block types
 
-            # Add a page separator to keep logical breaks (optional)
-            parts_formatted.append("\n")
-            parts_plain.append("\n")
+            # Separate pages with blank line
+            formatted_doc_parts.append("\n".join(page_parts).strip())
 
         pdf.close()
 
-        # Build final texts
-        formatted_text = "\n".join(parts_formatted).strip()
-        plain_text_all = "\n".join(parts_plain).strip()
+        # Compose final texts
+        formatted_text = ("\n\n".join([p for p in formatted_doc_parts if p])).strip()
+        plain_text = self._strip_formatting_markers(formatted_text)
+
+        # Optional: also create a placeholder-preview PDF (visual redaction) for reference
+        placeholder_pdf_s3_key = None
+        try:
+            placeholder_local = f"/tmp/{self.document_id}_placeholders.pdf"
+            pdf2 = fitz.open(file_path)
+            for page_index in range(len(pdf2)):
+                page = pdf2[page_index]
+                p_dict = page.get_text("dict")
+                loc_counter = 0
+                for blk in p_dict.get("blocks", []):
+                    if blk.get("type") == 1:
+                        loc_counter += 1
+                        # Find corresponding image_info by sequence
+                        # (best-effort; mainly for preview, not required for logic)
+                        name = None
+                        # We assigned placeholders in order, so we can’t 100% map back without extra map.
+                        # Just draw a neutral gray box with "IMAGE" text:
+                        rect = fitz.Rect(blk['bbox'])
+                        page.add_redact_annot(
+                            rect,
+                            text="IMAGE",
+                            fill=(0.92, 0.92, 0.92),
+                            text_color=(0, 0, 0),
+                            fontname="helv",
+                            fontsize=9,
+                            align=1,
+                        )
+                page.apply_redactions()
+            pdf2.save(placeholder_local, garbage=4, deflate=True, clean=True)
+            pdf2.close()
+            placeholder_pdf_s3_key = self._save_pdf_with_placeholders_to_s3(placeholder_local)
+            try:
+                os.unlink(placeholder_local)
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning(f"Could not create placeholder-preview PDF: {e}")
 
         result = {
             'formatted_text': formatted_text,
-            'plain_text': plain_text_all,
-            'method': 'pdf_pymupdf_inline_placeholders',
+            'plain_text': plain_text,
+            'method': 'pdf_pymupdf_blocks',
             'total_image_references': images_detected_total,
             'unique_image_files': images_detected_total,
             'tables_count': 0,
             'headings_count': 0,
-            'pages_processed': len(parts_plain),  # approximate
-            'placeholder_pdf_s3': None,  # we no longer produce redaction preview PDF
+            'placeholder_pdf_s3': f"s3://{S3_BUCKET}/{placeholder_pdf_s3_key}" if placeholder_pdf_s3_key else None,
+            'pages_processed': pages_processed
         }
-        logger.info(f"PDF processing (inline) complete. Images detected: {images_detected_total}.")
+        logger.info(f"PDF processing complete. Images: {images_detected_total}.")
         return result
 
     def _upload_image_to_s3_ext(self, image_data: bytes, placeholder_name: str, ext: str, original_filename: str) -> Optional[str]:
-        """Upload PDF image bytes to S3 honoring the original extension."""
+        """Upload image bytes to S3 honoring original extension."""
         if not S3_BUCKET:
             logger.error("S3_BUCKET not configured")
             return None
@@ -494,7 +476,7 @@ class EnhancedDocumentProcessor:
                     'original_filename': original_filename,
                     'upload_timestamp': datetime.utcnow().isoformat(),
                     'processing_timestamp': self.processing_timestamp,
-                    'source': 'pdf_pymupdf_inline',
+                    'source': 'pdf_pymupdf' if ext else 'unknown',
                 }
             )
             logger.info(f"S3 Upload: {placeholder_name} → s3://{S3_BUCKET}/{s3_key}")
@@ -503,7 +485,29 @@ class EnhancedDocumentProcessor:
             logger.error(f"S3 upload failed for {placeholder_name}: {e}")
             return None
 
-    # ------------------------ DOCX PROCESSING (UNCHANGED LOGIC) ------------------------
+    def _save_pdf_with_placeholders_to_s3(self, local_pdf_path: str) -> str:
+        """Upload the placeholder-preview PDF to S3 alongside text artifacts."""
+        if not S3_BUCKET:
+            raise Exception("S3_BUCKET not configured for PDF upload")
+        timestamp_prefix = datetime.utcnow().strftime('%Y/%m/%d')
+        base_path = f"document_extractions/{timestamp_prefix}/{self.document_id}"
+        s3_key = f"{base_path}/placeholder_preview.pdf"
+        with open(local_pdf_path, "rb") as fh:
+            s3_client.put_object(
+                Bucket=S3_BUCKET,
+                Key=s3_key,
+                Body=fh.read(),
+                ContentType='application/pdf',
+                Metadata={
+                    'document_id': self.document_id,
+                    'processing_timestamp': self.processing_timestamp,
+                    'extraction_method': 'pdf_pymupdf_blocks',
+                }
+            )
+        logger.info(f"Uploaded placeholder PDF: s3://{S3_BUCKET}/{s3_key}")
+        return s3_key
+
+    # ------------------------ DOCX PROCESSING (original logic preserved) ------------------------
 
     def _process_docx_with_formatting(self, file_path: str) -> Dict[str, Any]:
         logger.info("Starting DOCX processing with formatting preservation...")
@@ -528,7 +532,7 @@ class EnhancedDocumentProcessor:
                 'unique_image_files': len(unique_image_files),
                 'tables_count': document_stats.get('tables_count', 0),
                 'headings_count': document_stats.get('headings_count', 0),
-                'pages_processed': 1,
+                'pages_processed': 1
             }
 
     def _extract_styles(self, docx_zip: zipfile.ZipFile) -> Dict[str, Dict]:
@@ -761,11 +765,12 @@ class EnhancedDocumentProcessor:
                         'is_duplicate_reference': img_file in [img['original_filename'] for img in self.processed_images],
                         'page_number': 1,
                         'extraction_method': 'enhanced_docx_with_formatting',
+                        'ai_processed': False
                     }
                     self.processed_images.append(image_info)
                     self.placeholders[placeholder_name] = s3_key
                     self._store_image_metadata(image_info)
-                    current_text = current_text.replace(image_ref['marker'], f"\n![{placeholder_name}]({s3_key})\n")
+                    current_text = current_text.replace(image_ref['marker'], f"\n![{placeholder_name}]()\n")
                     logger.info(f"Processed {placeholder_name}: ref#{ref_idx} → {img_file}")
                     self.image_counter += 1
                 else:
@@ -873,19 +878,29 @@ class EnhancedDocumentProcessor:
             logger.error(f"S3 upload failed for {placeholder_name}: {e}")
             return None
 
+    # ------------------------ DynamoDB (images) ------------------------
+
     def _store_image_metadata(self, image_info: Dict[str, Any]) -> None:
+        """
+        Store image metadata with key schema that matches your image-processor:
+          PK: document_id (String), SK: image_number (Number)
+        """
         if not images_table:
             logger.warning("Images table not available")
             return
         try:
             ttl = datetime.utcnow() + timedelta(days=30)
-            # NOTE: your images table key schema might be (document_id, image_number).
-            # We're not changing it; just writing consistent attributes.
+
+            # Ensure keys exist
+            document_id = self.document_id
+            image_number = image_info.get('image_number')
+            if image_number is None:
+                # fallback: assign from counter to avoid invalid item
+                image_number = self.image_counter
+
             item = {
-                'document_id': self.document_id,
-                'image_number': image_info.get('image_number'),  # sort key in your image-processor code
-                'image_id': f"{self.document_id}_{image_info.get('reference_number')}_{int(time.time() * 1000)}",
-                'reference_number': image_info.get('reference_number'),
+                'document_id': document_id,        # PK
+                'image_number': int(image_number), # SK (Number)
                 'placeholder': image_info.get('placeholder'),
                 's3_bucket': S3_BUCKET,
                 's3_key': image_info.get('s3_key'),
@@ -894,7 +909,7 @@ class EnhancedDocumentProcessor:
                 'size_bytes': image_info.get('size_bytes'),
                 'is_duplicate_reference': image_info.get('is_duplicate_reference', False),
                 'page_number': image_info.get('page_number', 1),
-                'sequence_in_page': image_info.get('sequence_in_page'),
+                'sequence_in_page': image_info.get('sequence_in_page', 0),
                 'page_size': image_info.get('page_size'),
                 'bbox': image_info.get('bbox'),
                 'bbox_norm': image_info.get('bbox_norm'),
@@ -906,7 +921,8 @@ class EnhancedDocumentProcessor:
                 'ttl': int(ttl.timestamp()),
             }
             images_table.put_item(Item=item)
-            logger.info(f"DynamoDB: Stored metadata for {image_info.get('placeholder')}")
+            logger.info(f"DynamoDB: Stored metadata for {image_info.get('placeholder')} "
+                        f"(doc={document_id}, img#={item['image_number']})")
         except Exception as e:
             logger.error(f"DynamoDB storage failed for {image_info.get('placeholder')}: {e}")
 
@@ -1022,7 +1038,7 @@ class EnhancedDocumentProcessor:
             "",
         ]
         if metadata.get('images'):
-            report_lines.extend(["EXTRACTED IMAGES:", ""])
+            report_lines.extend(["EXTRACTED IMAGES:", ""] )
             for img in metadata['images']:
                 report_lines.append(f"  - {img['placeholder']}: {img['s3_location']}")
                 report_lines.append(f"    Original: {img['original_filename']} ({img['size_bytes']:,} bytes)")
@@ -1038,7 +1054,7 @@ class EnhancedDocumentProcessor:
         ])
         return "\n".join(report_lines)
 
-    # ------------------------ Text backup to /tmp + DynamoDB ------------------------
+    # ------------------------ Text backup to /tmp ------------------------
 
     def _store_formatted_text(self, formatted_text: str) -> bool:
         logger.info(f"Storing text for document {self.document_id}")
@@ -1091,14 +1107,15 @@ class EnhancedDocumentProcessor:
 
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
-    AWS Lambda handler with integrated image AI processing trigger (DOCX + PDF inline placeholders)
+    AWS Lambda handler with unified DOCX + PDF pipeline + AI trigger (document-level SQS)
     """
     request_id = getattr(context, 'aws_request_id', str(uuid.uuid4()))
     try:
         logger.info(f"Document processor started - Request ID: {request_id}")
+        logger.info(f"Event keys: {list(event.keys()) if isinstance(event, dict) else type(event)}")
 
         # Health check
-        if event.get('action') == 'health_check':
+        if isinstance(event, dict) and event.get('action') == 'health_check':
             return {
                 'statusCode': 200,
                 'body': json.dumps({
@@ -1108,12 +1125,11 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     'request_id': request_id,
                     'features': [
                         'Enhanced DOCX processing with formatting preservation',
-                        'PDF inline placeholders (PyMuPDF reading-order)',
-                        'Automatic AI image processing trigger',
-                        'S3 file storage for extracted text',
-                        'DynamoDB metadata storage',
+                        'PDF processing with inline placeholders (reading-order)',
+                        'Automatic AI processing trigger (document-level SQS)',
+                        'S3 file storage for extracted text and PDFs',
+                        'DynamoDB metadata storage (doc_id + image_number)',
                         'Event-driven architecture support',
-                        'SQS and Lambda invoke integration',
                     ],
                     'ai_integration': {
                         'sqs_configured': bool(IMAGE_PROCESSING_QUEUE_URL),
@@ -1124,19 +1140,20 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'headers': {'Content-Type': 'application/json', 'X-Request-ID': request_id}
             }
 
-        # SQS batch
-        if 'Records' in event and event['Records']:
+        # SQS batch (messages point to S3 file to download & process)
+        if isinstance(event, dict) and 'Records' in event and event['Records']:
             results: List[Dict[str, Any]] = []
             for record in event['Records']:
                 try:
                     message_body = json.loads(record['body'])
                     file_info = message_body['file_info']
                     s3_key = file_info['key']
+                    s3_bucket = file_info.get('bucket') or S3_BUCKET
                     original_filename = Path(s3_key).name
                     document_id = generate_unique_document_id(original_filename)
                     logger.info(f"SQS → processing {original_filename} as {document_id}")
                     local_path = f"/tmp/{document_id}_{original_filename}"
-                    s3_client.download_file(S3_BUCKET, s3_key, local_path)
+                    s3_client.download_file(s3_bucket, s3_key, local_path)
                     processor = EnhancedDocumentProcessor(document_id)
                     result = processor.process_document(local_path)
                     results.append(result)
@@ -1162,9 +1179,9 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             }
 
         # Direct invocation
-        s3_key = event.get('s3_key') or event.get('key')
-        s3_bucket = event.get('s3_bucket') or S3_BUCKET
-        original_filename = event.get('original_filename')
+        s3_key = event.get('s3_key') or event.get('key') if isinstance(event, dict) else None
+        s3_bucket = (event.get('s3_bucket') if isinstance(event, dict) else None) or S3_BUCKET
+        original_filename = event.get('original_filename') if isinstance(event, dict) else None
         if not s3_bucket or not s3_key:
             return {
                 'statusCode': 400,
