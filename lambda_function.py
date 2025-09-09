@@ -607,13 +607,7 @@ class EnhancedDocumentProcessor:
         if not text:
             return text
         t = text
-        if formatting.get('bold'):
-            t = f"**{t}**"
-        if formatting.get('italic'):
-            t = f"*{t}*"
-        if formatting.get('underline'):
-            t = f"<u>{t}</u>"
-        return t
+        if formatting.g
 
     def _is_heading_paragraph(self, para_elem, styles_info: Dict) -> bool:
         style_info = self._get_paragraph_style(para_elem, styles_info)
