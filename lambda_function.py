@@ -1,7 +1,13 @@
 """
-Complete Integrated Document Processor with Auto AI Image Processing
-Extracts text/images from DOCX & PDF, sends images to SQS/Bedrock,
-and writes reconstructed_text.md with inline AI analyses replacing image markers.
+Unified DOCX/PDF Extractor + Image-AI Consumer with reconstructed_documents outputs.
+
+What you get for BOTH DOCX & PDF:
+- formatted_text.md with inline markers: ![PLACEHOLDER](s3://bucket/key)
+- SQS message for downstream AI analysis
+- Consumer writes:
+  - reconstructed_text.md (base path)
+  - reconstructed_documents/reconstructed_text.md
+  - reconstructed_documents/manifest.json (rich, per-image analysis + positions)
 """
 
 import json
@@ -250,7 +256,6 @@ class EnhancedDocumentProcessor:
                 'traceback': traceback.format_exc(),
             }
         finally:
-            # Clean local file if exists
             try:
                 if os.path.exists(file_path):
                     os.unlink(file_path)
@@ -285,6 +290,8 @@ class EnhancedDocumentProcessor:
             'page_size': img.get('page_size'),
             'ext': img.get('ext', 'png'),
             'original_filename': img.get('original_filename'),
+            'reference_number': img.get('reference_number'),
+            'upload_timestamp': img.get('upload_timestamp'),
         } for img in self.processed_images]
 
         message_body = {
@@ -301,7 +308,8 @@ class EnhancedDocumentProcessor:
             'reconstruction': {
                 'inline_markers': True,
                 'marker_format': '![{placeholder}](' + 's3://{bucket}/{key}' + ')',
-                'output_reconstructed_key': 'reconstructed_text.md'
+                'output_reconstructed_key': 'reconstructed_text.md',
+                'reconstructed_documents_dir': 'reconstructed_documents'   # <--- NEW: standard dir
             }
         }
 
@@ -358,10 +366,8 @@ class EnhancedDocumentProcessor:
             page_rect = page.rect
             page_w, page_h = float(page_rect.width), float(page_rect.height)
 
-            # Collect page plain text (for reference/report only)
             extracted_plain_parts.append(page.get_text("text"))
 
-            # Reading-order dictionary
             p_dict = page.get_text("dict")
             seq_in_page = 0
 
@@ -421,9 +427,7 @@ class EnhancedDocumentProcessor:
                     self.placeholders[placeholder_name] = s3_key
                     self._store_image_metadata(img_info)
 
-                    # Insert the inline marker in Markdown at this point
                     inline_parts.append(f"\n![{placeholder_name}](s3://{S3_BUCKET}/{s3_key})\n")
-
                     self.image_counter += 1
 
         pdf.close()
@@ -714,7 +718,6 @@ class EnhancedDocumentProcessor:
                     self.processed_images.append(image_info)
                     self.placeholders[placeholder_name] = s3_key
                     self._store_image_metadata(image_info)
-                    # Replace the placeholder token with Markdown image marker
                     current_text = current_text.replace(image_ref['marker'], f"\n![{placeholder_name}](s3://{S3_BUCKET}/{s3_key})\n")
                     logger.info(f"Processed {placeholder_name}: ref#{ref_idx} → {img_file}")
                     self.image_counter += 1
@@ -990,8 +993,6 @@ class EnhancedDocumentProcessor:
         ])
         return "\n".join(report_lines)
 
-    # ---- Optional DynamoDB backup of text ----
-
     def _store_formatted_text(self, formatted_text: str) -> bool:
         if not text_table:
             return False
@@ -1025,10 +1026,7 @@ class EnhancedDocumentProcessor:
 # -----------------------------------------------------------------------------
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
-    Extractor handler:
-    - Supports direct invocation (s3_bucket + s3_key + original_filename)
-    - Supports batch via SQS with records containing {'file_info': {'key': ...}}
-    - Supports 'health_check' action
+    Extractor handler
     """
     request_id = getattr(context, 'aws_request_id', str(uuid.uuid4()))
     try:
@@ -1140,10 +1138,7 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
 # Consumer (SQS → Bedrock → Reconstruct) Lambda Handler
 # -----------------------------------------------------------------------------
 def _bedrock_analyze_image(image_bytes: bytes, media_type: str = 'image/png') -> str:
-    """
-    Calls Bedrock Anthropic Messages API with a single image.
-    Returns Markdown analysis text.
-    """
+    """Calls Bedrock Anthropic Messages API with a single image. Returns Markdown analysis text."""
     try:
         b64_img = base64.b64encode(image_bytes).decode('utf-8')
         body = {
@@ -1155,26 +1150,18 @@ def _bedrock_analyze_image(image_bytes: bytes, media_type: str = 'image/png') ->
                     "role": "user",
                     "content": [
                         {"type": "text", "text": ANALYSIS_PROMPT},
-                        {
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": media_type, "data": b64_img}
-                        }
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64_img}}
                     ]
                 }
             ]
         }
-        response = bedrock_runtime.invoke_model(
-            modelId=ANALYSIS_MODEL_ID,
-            body=json.dumps(body).encode('utf-8')
-        )
+        response = bedrock_runtime.invoke_model(modelId=ANALYSIS_MODEL_ID, body=json.dumps(body).encode('utf-8'))
         payload = json.loads(response.get('body', '{}'))
-        # Anthropic format: the assistant reply is in payload["content"][0]["text"]
         content = payload.get('content', [])
         if content and isinstance(content, list):
             for block in content:
                 if block.get('type') == 'text' and block.get('text'):
                     return block['text'].strip()
-        # Fallback if structure differs
         return json.dumps(payload, indent=2)
     except Exception as e:
         logger.error(f"Bedrock analysis failed: {e}")
@@ -1182,27 +1169,24 @@ def _bedrock_analyze_image(image_bytes: bytes, media_type: str = 'image/png') ->
 
 
 def _detect_media_type_from_key(key: str) -> str:
-    key = key.lower()
-    if key.endswith('.jpg') or key.endswith('.jpeg'):
-        return 'image/jpeg'
-    if key.endswith('.png'):
-        return 'image/png'
-    if key.endswith('.gif'):
-        return 'image/gif'
-    if key.endswith('.tif') or key.endswith('.tiff'):
-        return 'image/tiff'
-    if key.endswith('.bmp'):
-        return 'image/bmp'
+    k = key.lower()
+    if k.endswith(('.jpg', '.jpeg')): return 'image/jpeg'
+    if k.endswith('.png'): return 'image/png'
+    if k.endswith('.gif'): return 'image/gif'
+    if k.endswith(('.tif', '.tiff')): return 'image/tiff'
+    if k.endswith('.bmp'): return 'image/bmp'
     return 'image/png'
 
 
 def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     """
     SQS-triggered consumer:
-    - Reads extractor's unified message
     - Loads formatted_text.md
-    - For each image: runs Bedrock analysis and replaces the inline marker with the analysis text
-    - Saves reconstructed_text.md to the same S3 folder
+    - For each image: Bedrock analysis → replace the inline marker in-place
+    - Writes BOTH:
+        1) reconstructed_text.md  (base path)
+        2) reconstructed_documents/reconstructed_text.md
+           reconstructed_documents/manifest.json  (rich JSON manifest for downstream)
     """
     request_id = getattr(context, 'aws_request_id', str(uuid.uuid4()))
     try:
@@ -1216,14 +1200,14 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
             try:
                 msg = json.loads(record['body'])
                 document_id = msg['document_id']
-                s3_base_path = msg['s3_base_path']  # e.g., s3://bucket/document_extractions/YYY.../{document_id}/
+                s3_base_path = msg['s3_base_path']  # s3://bucket/prefix/.../{document_id}/
                 formatted_text_s3_key = msg.get('formatted_text_s3_key')
                 images = msg.get('images', [])
                 reconstruction = msg.get('reconstruction', {})
                 output_reconstructed_key = reconstruction.get('output_reconstructed_key', 'reconstructed_text.md')
+                reconstructed_dir = reconstruction.get('reconstructed_documents_dir', 'reconstructed_documents')
 
-                # Resolve bucket & key from s3_base_path
-                # s3_base_path like: s3://BUCKET/prefix/.../{document_id}/
+                # Resolve bucket & base prefix
                 m = re.match(r'^s3://([^/]+)/(.+)$', s3_base_path)
                 if not m:
                     raise Exception(f"Invalid s3_base_path: {s3_base_path}")
@@ -1237,6 +1221,9 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 obj = s3_client.get_object(Bucket=bucket, Key=formatted_text_s3_key)
                 formatted_text = obj['Body'].read().decode('utf-8')
 
+                # Collect per-image analyses for manifest
+                analyses_for_manifest: List[Dict[str, Any]] = []
+
                 # For each image → analyze → replace marker
                 for img in images:
                     placeholder = img['placeholder']
@@ -1248,17 +1235,30 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     analysis_md = _bedrock_analyze_image(img_bytes, media_type=media_type)
 
                     # Replace the exact marker: ![PLACEHOLDER](...)
-                    # We do not rely on the s3_key inside the parentheses to allow flexibility.
                     pattern = re.compile(r'!\[' + re.escape(placeholder) + r'\]\([^)]+\)')
                     replacement = f"\n<!-- {placeholder} -->\n{analysis_md}\n"
                     formatted_text, n = pattern.subn(replacement, formatted_text, count=1)
                     logger.info(f"Replaced marker for {placeholder} (occurrences: {n})")
 
+                    analyses_for_manifest.append({
+                        "placeholder": placeholder,
+                        "s3_image": f"s3://{S3_BUCKET}/{img_key}",
+                        "page_number": img.get("page_number"),
+                        "sequence_in_page": img.get("sequence_in_page"),
+                        "bbox": img.get("bbox"),
+                        "bbox_norm": img.get("bbox_norm"),
+                        "page_size": img.get("page_size"),
+                        "analysis_markdown": analysis_md
+                    })
+
                     # Optional: mark ai_processed in DynamoDB
                     if images_table:
                         try:
                             images_table.update_item(
-                                Key={'document_id': document_id, 'image_id': f"{document_id}_{img.get('reference_number')}_{img.get('upload_timestamp', '').replace(':','').replace('-','').replace('.','') or 't'}"},
+                                Key={
+                                    'document_id': document_id,
+                                    'image_id': f"{document_id}_{img.get('reference_number')}_{(img.get('upload_timestamp','')).replace(':','').replace('-','').replace('.','') or 't'}"
+                                },
                                 UpdateExpression="SET ai_processed = :true, ai_processed_timestamp = :ts",
                                 ExpressionAttributeValues={
                                     ':true': True,
@@ -1268,20 +1268,55 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                         except Exception:
                             pass
 
-                # Save reconstructed_text.md
-                reconstructed_key = f"{base_prefix}/{output_reconstructed_key}"
+                # Save reconstructed_text.md (base)
+                reconstructed_key_base = f"{base_prefix}/{output_reconstructed_key}"
                 s3_client.put_object(
                     Bucket=bucket,
-                    Key=reconstructed_key,
+                    Key=reconstructed_key_base,
                     Body=formatted_text.encode('utf-8'),
                     ContentType='text/markdown; charset=utf-8',
                     Metadata={'document_id': document_id, 'reconstructed': 'true', 'ts': datetime.utcnow().isoformat()}
                 )
 
+                # ALSO save under reconstructed_documents/
+                recon_dir_prefix = f"{base_prefix}/{reconstructed_dir}"
+                reconstructed_key_alt = f"{recon_dir_prefix}/reconstructed_text.md"
+                s3_client.put_object(
+                    Bucket=bucket,
+                    Key=reconstructed_key_alt,
+                    Body=formatted_text.encode('utf-8'),
+                    ContentType='text/markdown; charset=utf-8',
+                    Metadata={'document_id': document_id, 'reconstructed': 'true', 'ts': datetime.utcnow().isoformat()}
+                )
+
+                # Manifest JSON (rich) for downstream consumers
+                manifest = {
+                    "document_id": document_id,
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "source_formatted_text": f"s3://{bucket}/{formatted_text_s3_key}",
+                    "outputs": {
+                        "base_reconstructed_md": f"s3://{bucket}/{reconstructed_key_base}",
+                        "reconstructed_documents_reconstructed_md": f"s3://{bucket}/{reconstructed_key_alt}"
+                    },
+                    "images_count": len(images),
+                    "analyses": analyses_for_manifest,
+                    "notes": "This file exists so that pipelines expecting reconstructed_documents/* work for both DOCX and PDF."
+                }
+                manifest_key = f"{recon_dir_prefix}/manifest.json"
+                s3_client.put_object(
+                    Bucket=bucket,
+                    Key=manifest_key,
+                    Body=json.dumps(manifest, indent=2).encode('utf-8'),
+                    ContentType='application/json; charset=utf-8',
+                    Metadata={'document_id': document_id, 'reconstructed': 'true', 'ts': datetime.utcnow().isoformat()}
+                )
+
                 results.append({
                     'document_id': document_id,
-                    'reconstructed_key': f"s3://{bucket}/{reconstructed_key}",
-                    'images_processed': len(images)
+                    'images_processed': len(images),
+                    'reconstructed_text_base': f"s3://{bucket}/{reconstructed_key_base}",
+                    'reconstructed_documents_text': f"s3://{bucket}/{reconstructed_key_alt}",
+                    'reconstructed_documents_manifest': f"s3://{bucket}/{manifest_key}"
                 })
 
             except Exception as e:
