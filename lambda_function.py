@@ -1,13 +1,4 @@
 # -*- coding: utf-8 -*-
-"""
-Unified extractor (DOCX + PDF) + consumer.
-
-- DOCX path: unchanged 'enhanced_docx_with_formatting' logic (XML styles, lists, tables, headings).
-- PDF path: inline markers (no watermark PDF). Placeholders named IMAGE_* to match DOCX.
-- SQS trigger unchanged in spirit; now includes formatted_text_s3_key so consumer can load it.
-- Consumer writes reconstructed_text (base) + legacy UI folder files for parity with DOCX.
-"""
-
 import json
 import boto3
 import logging
@@ -23,33 +14,25 @@ from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime, timedelta
 
-# ---- PDF support
 try:
-    import fitz  # PyMuPDF
+    import fitz
 except Exception:
     fitz = None
 
-# ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------- Env / AWS ----------------
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 S3_BUCKET = os.environ.get('S3_BUCKET')
 DYNAMODB_TEXT_TABLE = os.environ.get('EXTRACTED_TEXT_TABLE', 'extracted_text')
 DYNAMODB_IMAGES_TABLE = os.environ.get('IMAGES_TABLE', 'images')
-MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', '104857600'))  # 100MB
-
+MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE', '104857600'))
 IMAGE_PROCESSOR_LAMBDA_ARN = os.environ.get('IMAGE_PROCESSOR_LAMBDA_ARN')
-IMAGE_PROCESSING_QUEUE_URL = os.environ.get('IMAGE_BATCH_QUEUE_URL')
+IMAGE_PROCESSING_QUEUE_URL = os.environ.get('IMAGE_PROCESSING_QUEUE_URL') or os.environ.get('IMAGE_BATCH_QUEUE_URL')
 USE_ASYNC_PROCESSING = os.environ.get('USE_ASYNC_PROCESSING', 'true').lower() == 'true'
+EVENT_BUS_NAME = os.environ.get('EVENT_BUS_NAME', 'default')
+MODULE_ROOT_PREFIX = os.environ.get('MODULE_ROOT_PREFIX', 'submissions')
 
-s3_client = boto3.client('s3', region_name=AWS_REGION)
-dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
-lambda_client = boto3.client('lambda', region_name=AWS_REGION)
-sqs_client = boto3.client('sqs', region_name=AWS_REGION)
-
-# Bedrock (consumer)
 bedrock_runtime = boto3.client('bedrock-runtime', region_name=AWS_REGION)
 ANALYSIS_MODEL_ID = os.environ.get('ANALYSIS_MODEL_ID', 'anthropic.claude-3-7-sonnet-20250219-v1:0')
 ANALYSIS_MAX_TOKENS = int(os.environ.get('ANALYSIS_MAX_TOKENS', '800'))
@@ -61,7 +44,12 @@ ANALYSIS_PROMPT = os.environ.get(
     "relevant insights for academic assignment grading."
 )
 
-# ---------------- Dynamo tables ----------------
+s3_client = boto3.client('s3', region_name=AWS_REGION)
+dynamodb = boto3.resource('dynamodb', region_name=AWS_REGION)
+lambda_client = boto3.client('lambda', region_name=AWS_REGION)
+sqs_client = boto3.client('sqs', region_name=AWS_REGION)
+events_client = boto3.client('events', region_name=AWS_REGION)
+
 text_table = None
 images_table = None
 
@@ -69,20 +57,21 @@ def initialize_dynamodb_tables():
     global text_table, images_table
     try:
         text_table = dynamodb.Table(DYNAMODB_TEXT_TABLE) if DYNAMODB_TEXT_TABLE else None
-        if text_table: text_table.load()
+        if text_table:
+            text_table.load()
     except Exception as e:
         logger.warning(f"Text table init failed: {e}")
         text_table = None
     try:
         images_table = dynamodb.Table(DYNAMODB_IMAGES_TABLE) if DYNAMODB_IMAGES_TABLE else None
-        if images_table: images_table.load()
+        if images_table:
+            images_table.load()
     except Exception as e:
         logger.warning(f"Images table init failed: {e}")
         images_table = None
 
 initialize_dynamodb_tables()
 
-# ---------------- Utilities ----------------
 def _now_parts():
     dt = datetime.utcnow()
     return dt.strftime('%Y'), dt.strftime('%m'), dt.strftime('%d'), dt.strftime('%H')
@@ -108,9 +97,34 @@ def _md_strip(formatted_text: str) -> str:
     t = re.sub(r'\n{3,}', '\n\n', t)
     return t.strip()
 
-# ======================================================================
-# EnhancedDocumentProcessor (DOCX logic unchanged) + updated PDF inline
-# ======================================================================
+def _emit_event(detail_type: str, detail: Dict[str, Any]) -> None:
+    try:
+        events_client.put_events(
+            Entries=[{
+                "Source": "ai-grading-system",
+                "DetailType": detail_type,
+                "Detail": json.dumps(detail, default=str),
+                "EventBusName": EVENT_BUS_NAME
+            }]
+        )
+    except Exception as e:
+        logger.warning(f"EventBridge put_events failed: {e}")
+
+def _parse_student_path_from_key(key: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    parts = key.split("/")
+    try:
+        i = parts.index(MODULE_ROOT_PREFIX)
+        module_id = parts[i + 1]
+        if parts[i + 2] != "assignments":
+            return None, None, None
+        assignment_id = parts[i + 3]
+        if parts[i + 4] != "files":
+            return None, None, None
+        student_id = parts[i + 5]
+        return module_id, assignment_id, student_id
+    except Exception:
+        return None, None, None
+
 class EnhancedDocumentProcessor:
     def __init__(self, document_id: str):
         self.document_id = document_id
@@ -118,6 +132,9 @@ class EnhancedDocumentProcessor:
         self.processed_images: List[Dict[str, Any]] = []
         self.image_counter = 1
         self.processing_timestamp = datetime.utcnow().isoformat()
+        self.module_id: Optional[str] = None
+        self.assignment_id: Optional[str] = None
+        self.student_id: Optional[str] = None
         self.namespaces = {
             'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
             'pic': 'http://schemas.openxmlformats.org/drawingml/2006/picture',
@@ -126,7 +143,6 @@ class EnhancedDocumentProcessor:
             'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
         }
 
-    # ---------------- Main entry ----------------
     def process_document(self, file_path: str) -> Dict[str, Any]:
         start_time = time.time()
         try:
@@ -135,39 +151,29 @@ class EnhancedDocumentProcessor:
             size = os.path.getsize(file_path)
             if size > MAX_FILE_SIZE:
                 raise Exception(f"File too large: {size} bytes")
-
             if file_path.lower().endswith('.docx'):
-                result = self._process_docx_with_formatting(file_path)   # UNCHANGED
+                result = self._process_docx_with_formatting(file_path)
             elif file_path.lower().endswith('.pdf'):
-                result = self._process_pdf_with_inline_markers(file_path)  # UPDATED PDF
+                result = self._process_pdf_with_inline_markers(file_path)
             else:
                 raise Exception("Unsupported file type")
-
             if not result.get('formatted_text', '').strip():
                 raise Exception("Text extraction failed - no content found")
-
-            # Save text artifacts to S3 (same base path naming)
             saved_keys = self._save_text_files_to_s3(result['formatted_text'])
-
-            # Optional backup to DynamoDB
             if text_table:
                 try:
                     self._store_formatted_text(result['formatted_text'])
                 except Exception as e:
                     logger.warning(f"DynamoDB backup failed: {e}")
-
-            # Trigger AI processing (send formatted_text_s3_key)
             ai_trigger = self._trigger_image_ai_processing(
                 extracted_text=result['formatted_text'],
                 images_count=len(self.processed_images),
                 pipeline_mode=result.get('method', 'enhanced_docx_with_formatting'),
                 formatted_text_s3_key=saved_keys.get('formatted_s3_key')
             )
-
             elapsed = time.time() - start_time
             yyyy, mm, dd, _ = _now_parts()
             base_path = f"document_extractions/{yyyy}/{mm}/{dd}/{self.document_id}"
-
             return {
                 'success': True,
                 'document_id': self.document_id,
@@ -200,7 +206,6 @@ class EnhancedDocumentProcessor:
                 'errors': [],
                 'warnings': [],
             }
-
         except Exception as e:
             logger.error(f"Processing failed: {e}")
             return {
@@ -232,14 +237,11 @@ class EnhancedDocumentProcessor:
             except Exception:
                 pass
 
-    # ---------------- AI trigger ----------------
     def _trigger_image_ai_processing(self, extracted_text: str, images_count: int, pipeline_mode: str, formatted_text_s3_key: Optional[str]) -> Dict[str, Any]:
         if images_count == 0:
             return {'triggered': False, 'reason': 'no_images'}
-
         yyyy, mm, dd, _ = _now_parts()
         s3_base_path = f"s3://{S3_BUCKET}/document_extractions/{yyyy}/{mm}/{dd}/{self.document_id}/"
-
         payload_images = [{
             'placeholder': img.get('placeholder'),
             's3_bucket': S3_BUCKET,
@@ -254,7 +256,6 @@ class EnhancedDocumentProcessor:
             'reference_number': img.get('reference_number', 0),
             'upload_timestamp': img.get('upload_timestamp', self.processing_timestamp),
         } for img in self.processed_images]
-
         message_body = {
             'document_id': self.document_id,
             'images_count': images_count,
@@ -270,9 +271,11 @@ class EnhancedDocumentProcessor:
                 'inline_markers': True,
                 'output_reconstructed_key': 'reconstructed_text.md',
                 'reconstructed_documents_dir': 'reconstructed_documents'
-            }
+            },
+            'module_id': self.module_id,
+            'assignment_id': self.assignment_id,
+            'student_id': self.student_id
         }
-
         try:
             if USE_ASYNC_PROCESSING:
                 if not IMAGE_PROCESSING_QUEUE_URL:
@@ -286,41 +289,50 @@ class EnhancedDocumentProcessor:
                         'PipelineMode': {'StringValue': pipeline_mode, 'DataType': 'String'},
                     }
                 )
+                _emit_event("ImageBatchEnqueued", {
+                    "document_id": self.document_id,
+                    "images_count": images_count,
+                    "queue": IMAGE_PROCESSING_QUEUE_URL,
+                    "module_id": self.module_id,
+                    "assignment_id": self.assignment_id,
+                    "student_id": self.student_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
                 return {'triggered': True, 'method': 'sqs', 'message_id': resp.get('MessageId'), 'images_count': images_count}
             else:
                 if not IMAGE_PROCESSOR_LAMBDA_ARN:
                     return {'triggered': False, 'reason': 'lambda_arn_not_configured'}
                 lambda_client.invoke(FunctionName=IMAGE_PROCESSOR_LAMBDA_ARN, InvocationType='Event', Payload=json.dumps(message_body).encode('utf-8'))
+                _emit_event("ImageBatchEnqueued", {
+                    "document_id": self.document_id,
+                    "images_count": images_count,
+                    "lambda": IMAGE_PROCESSOR_LAMBDA_ARN,
+                    "module_id": self.module_id,
+                    "assignment_id": self.assignment_id,
+                    "student_id": self.student_id,
+                    "timestamp": datetime.utcnow().isoformat()
+                })
                 return {'triggered': True, 'method': 'lambda_invoke', 'images_count': images_count}
         except Exception as e:
             logger.error(f"AI trigger failed: {e}")
             return {'triggered': False, 'error': str(e), 'method': 'failed'}
 
-    # ---------------- PDF (UPDATED: inline markers, IMAGE_* names) ----------------
     def _process_pdf_with_inline_markers(self, file_path: str) -> Dict[str, Any]:
         if fitz is None:
             raise Exception("PyMuPDF (fitz) not available")
-
-        logger.info("PDF → inline markers (no placeholder PDF)")
         pdf = fitz.open(file_path)
         inline_parts: List[str] = []
         extracted_plain_parts: List[str] = []
         images_detected_total = 0
-
         for page_index in range(len(pdf)):
             page = pdf[page_index]
             page_num = page_index + 1
-
-            # Text (plain)
             extracted_plain_parts.append(page.get_text("text"))
-
-            # Reading order dict
             p_dict = page.get_text("dict")
             seq_in_page = 0
             for blk in p_dict.get("blocks", []):
                 btype = blk.get("type")
                 if btype == 0:
-                    # text block
                     block_text = []
                     for line in blk.get("lines", []):
                         for span in line.get("spans", []):
@@ -329,16 +341,13 @@ class EnhancedDocumentProcessor:
                     txt = " ".join(block_text).strip()
                     if txt:
                         inline_parts.append(txt)
-
                 elif btype == 1:
-                    # image block
                     seq_in_page += 1
                     images_detected_total += 1
                     ext = (blk.get("ext") or "png").lower()
                     img_bytes = blk.get("image")
                     if not img_bytes:
                         continue
-
                     placeholder = f"IMAGE_{self.image_counter}_{int(time.time()*1000)}"
                     yyyy, mm, dd, hh = _now_parts()
                     key = f"extracted_images/{yyyy}/{mm}/{dd}/{hh}/{self.document_id}/{placeholder}.{ext}"
@@ -355,7 +364,6 @@ class EnhancedDocumentProcessor:
                             'source': 'pdf_inline_markers',
                         }
                     )
-
                     img_info = {
                         'placeholder': placeholder,
                         's3_key': key,
@@ -379,12 +387,9 @@ class EnhancedDocumentProcessor:
                     self.processed_images.append(img_info)
                     self.placeholders[placeholder] = key
                     self._store_image_metadata(img_info)
-
                     inline_parts.append(f"\n![{placeholder}](s3://{S3_BUCKET}/{key})\n")
                     self.image_counter += 1
-
         pdf.close()
-
         plain_text_all = "\n".join(extracted_plain_parts).strip()
         formatted_text = ("\n\n".join([p for p in inline_parts if p.strip()])).strip()
         return {
@@ -398,9 +403,7 @@ class EnhancedDocumentProcessor:
             'pages_processed': len(extracted_plain_parts),
         }
 
-    # ---------------- DOCX PROCESSING (UNCHANGED LOGIC) ----------------
     def _process_docx_with_formatting(self, file_path: str) -> Dict[str, Any]:
-        logger.info("Starting DOCX processing with formatting preservation (unchanged)")
         with zipfile.ZipFile(file_path, 'r') as docx_zip:
             styles_info = self._extract_styles(docx_zip)
             numbering_info = self._extract_numbering(docx_zip)
@@ -625,7 +628,9 @@ class EnhancedDocumentProcessor:
             with docx_zip.open('word/_rels/document.xml.rels') as rels_file:
                 rels_root = ET.fromstring(rels_file.read().decode('utf-8'))
                 for r in rels_root.findall('.//{http://schemas.openxmlformats.org/package/2006/relationships}Relationship'):
-                    rid = r.get('Id'); target = r.get('Target'); rtype = r.get('Type')
+                    rid = r.get('Id')
+                    target = r.get('Target')
+                    rtype = r.get('Type')
                     if rtype and 'image' in rtype.lower() and target:
                         full_path = f"word/{target}" if target.startswith('media/') else target
                         if full_path in image_files:
@@ -675,7 +680,9 @@ class EnhancedDocumentProcessor:
                         'is_duplicate_reference': img_file in [img['original_filename'] for img in self.processed_images],
                         'page_number': 1,
                         'sequence_in_page': image_ref['reference_number'] + 1,
-                        'bbox': None, 'bbox_norm': None, 'page_size': None,
+                        'bbox': None,
+                        'bbox_norm': None,
+                        'page_size': None,
                         'ext': 'png',
                         'extraction_method': 'enhanced_docx_with_formatting',
                     }
@@ -705,7 +712,6 @@ class EnhancedDocumentProcessor:
         plain_text = re.sub(r'\n\s*\n\s*\n', '\n\n', plain_text)
         return plain_text.strip()
 
-    # ---- S3 / Dynamo helpers
     def _upload_image_to_s3(self, image_data: bytes, placeholder_name: str, original_filename: str) -> Optional[str]:
         if not S3_BUCKET:
             return None
@@ -776,8 +782,10 @@ class EnhancedDocumentProcessor:
             'character_count': str(len(formatted_text)),
             'images_processed': str(len(self.processed_images)),
             'extraction_timestamp': datetime.utcnow().isoformat(),
+            'module_id': self.module_id or '',
+            'assignment_id': self.assignment_id or '',
+            'student_id': self.student_id or '',
         }
-        # formatted
         formatted_s3_key = f"{base_path}/formatted_text.md"
         s3_client.put_object(
             Bucket=S3_BUCKET, Key=formatted_s3_key,
@@ -785,7 +793,6 @@ class EnhancedDocumentProcessor:
             ContentType='text/markdown; charset=utf-8',
             Metadata=file_metadata
         )
-        # plain
         plain_text = self._strip_formatting_markers(formatted_text)
         plain_s3_key = f"{base_path}/plain_text.txt"
         s3_client.put_object(
@@ -794,7 +801,6 @@ class EnhancedDocumentProcessor:
             ContentType='text/plain; charset=utf-8',
             Metadata=file_metadata
         )
-        # metadata.json
         extraction_metadata = {
             'document_id': self.document_id,
             'processing_timestamp': self.processing_timestamp,
@@ -810,6 +816,9 @@ class EnhancedDocumentProcessor:
                 'plain_text': f"s3://{S3_BUCKET}/{plain_s3_key}",
                 'metadata': f"s3://{S3_BUCKET}/{base_path}/metadata.json",
             },
+            'module_id': self.module_id,
+            'assignment_id': self.assignment_id,
+            'student_id': self.student_id,
             'images': [
                 {
                     'placeholder': img.get('placeholder'),
@@ -828,7 +837,6 @@ class EnhancedDocumentProcessor:
             ContentType='application/json; charset=utf-8',
             Metadata=file_metadata
         )
-        # summary
         summary_report = self._generate_summary_report(self._strip_formatting_markers(formatted_text), extraction_metadata)
         summary_s3_key = f"{base_path}/extraction_summary.txt"
         s3_client.put_object(
@@ -888,6 +896,9 @@ class EnhancedDocumentProcessor:
                 'pages_processed': 1,
                 'images_processed': len(self.processed_images),
                 'placeholders': self.placeholders,
+                'module_id': self.module_id,
+                'assignment_id': self.assignment_id,
+                'student_id': self.student_id,
                 'ttl': int(ttl.timestamp()),
             }
             text_table.put_item(Item=item)
@@ -896,9 +907,17 @@ class EnhancedDocumentProcessor:
             logger.error(f"DynamoDB text storage failed: {e}")
             return False
 
-# =========================
-# Extractor Lambda handler
-# =========================
+    def _fallback_formatted_extraction(self, docx_zip: zipfile.ZipFile) -> Tuple[str, List[Dict], Dict]:
+        try:
+            with docx_zip.open('word/document.xml') as doc_xml:
+                xml_content = doc_xml.read().decode('utf-8')
+                text_content = re.sub(r'<.*?>', '', xml_content)
+                text_content = re.sub(r'\s+', ' ', text_content).strip()
+                return text_content, [], {'tables_count': 0, 'headings_count': 0}
+        except Exception as e:
+            logger.error(f"Fallback extraction failed: {e}")
+            return "", [], {'tables_count': 0, 'headings_count': 0}
+
 def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     request_id = getattr(context, 'aws_request_id', str(uuid.uuid4()))
     try:
@@ -908,8 +927,6 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'body': json.dumps({'status': 'healthy', 'service': 'unified-extractor', 'request_id': request_id}),
                 'headers': {'Content-Type': 'application/json'}
             }
-
-        # SQS batch (files to extract)
         if 'Records' in event and event['Records']:
             results: List[Dict[str, Any]] = []
             for record in event['Records']:
@@ -917,14 +934,48 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     message_body = json.loads(record['body'])
                     file_info = message_body['file_info']
                     s3_key = file_info['key']
+                    s3_bucket = file_info.get('bucket') or S3_BUCKET
                     original_filename = Path(s3_key).name
                     document_id = generate_unique_document_id(original_filename)
+                    module_id, assignment_id, student_id = _parse_student_path_from_key(s3_key)
+                    _emit_event("DocumentExtractionStarted", {
+                        "document_id": document_id,
+                        "bucket": s3_bucket,
+                        "s3_key": s3_key,
+                        "module_id": module_id,
+                        "assignment_id": assignment_id,
+                        "student_id": student_id,
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
                     local_path = f"/tmp/{document_id}_{original_filename}"
-                    s3_client.download_file(S3_BUCKET, s3_key, local_path)
+                    s3_client.download_file(s3_bucket, s3_key, local_path)
                     processor = EnhancedDocumentProcessor(document_id)
+                    processor.module_id = module_id
+                    processor.assignment_id = assignment_id
+                    processor.student_id = student_id
                     result = processor.process_document(local_path)
+                    _emit_event("DocumentExtractionCompleted", {
+                        "document_id": document_id,
+                        "bucket": s3_bucket,
+                        "s3_key": s3_key,
+                        "module_id": module_id,
+                        "assignment_id": assignment_id,
+                        "student_id": student_id,
+                        "images_extracted": result.get("images_extracted", 0),
+                        "timestamp": datetime.utcnow().isoformat()
+                    })
                     results.append(result)
                 except Exception as e:
+                    try:
+                        _emit_event("DocumentExtractionFailed", {
+                            "document_id": document_id if 'document_id' in locals() else None,
+                            "bucket": s3_bucket if 's3_bucket' in locals() else S3_BUCKET,
+                            "s3_key": s3_key if 's3_key' in locals() else None,
+                            "error": str(e),
+                            "timestamp": datetime.utcnow().isoformat()
+                        })
+                    except Exception:
+                        pass
                     logger.error(f"SQS record failed: {e}")
                     results.append({'success': False, 'error': str(e), 'traceback': traceback.format_exc()})
             successful = len([r for r in results if r.get('success')])
@@ -933,33 +984,66 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'body': json.dumps({'success': successful > 0, 'results': results, 'request_id': request_id}),
                 'headers': {'Content-Type': 'application/json'}
             }
-
-        # direct invocation
         s3_key = event.get('s3_key') or event.get('key')
         s3_bucket = event.get('s3_bucket') or S3_BUCKET
         if not s3_bucket or not s3_key:
             return {'statusCode': 400, 'body': json.dumps({'success': False, 'error': 'missing s3_bucket/s3_key'})}
         original_filename = event.get('original_filename') or Path(s3_key).name
         document_id = generate_unique_document_id(original_filename)
+        module_id, assignment_id, student_id = _parse_student_path_from_key(s3_key)
+        _emit_event("DocumentExtractionStarted", {
+            "document_id": document_id,
+            "bucket": s3_bucket,
+            "s3_key": s3_key,
+            "module_id": module_id,
+            "assignment_id": assignment_id,
+            "student_id": student_id,
+            "timestamp": datetime.utcnow().isoformat()
+        })
         local_path = f"/tmp/{document_id}_{original_filename}"
         s3_client.download_file(s3_bucket, s3_key, local_path)
         processor = EnhancedDocumentProcessor(document_id)
+        processor.module_id = module_id
+        processor.assignment_id = assignment_id
+        processor.student_id = student_id
         result = processor.process_document(local_path)
+        _emit_event("DocumentExtractionCompleted", {
+            "document_id": document_id,
+            "bucket": s3_bucket,
+            "s3_key": s3_key,
+            "module_id": module_id,
+            "assignment_id": assignment_id,
+            "student_id": student_id,
+            "images_extracted": result.get("images_extracted", 0),
+            "timestamp": datetime.utcnow().isoformat()
+        })
         return {'statusCode': 200 if result['success'] else 500, 'body': json.dumps(result)}
     except Exception as e:
         logger.error(f"Extractor error: {e}")
+        try:
+            _emit_event("DocumentExtractionFailed", {
+                "document_id": None,
+                "bucket": s3_bucket if 's3_bucket' in locals() else S3_BUCKET,
+                "s3_key": s3_key if 's3_key' in locals() else None,
+                "error": str(e),
+                "timestamp": datetime.utcnow().isoformat()
+            })
+        except Exception:
+            pass
         return {'statusCode': 500, 'body': json.dumps({'success': False, 'error': str(e), 'traceback': traceback.format_exc()})}
 
-# ============================================================
-# Consumer (SQS → Bedrock → replace markers → write artifacts)
-# ============================================================
 def _detect_media_type_from_key(key: str) -> str:
     k = key.lower()
-    if k.endswith(('.jpg', '.jpeg')): return 'image/jpeg'
-    if k.endswith('.png'): return 'image/png'
-    if k.endswith('.gif'): return 'image/gif'
-    if k.endswith(('.tif', '.tiff')): return 'image/tiff'
-    if k.endswith('.bmp'): return 'image/bmp'
+    if k.endswith(('.jpg', '.jpeg')):
+        return 'image/jpeg'
+    if k.endswith('.png'):
+        return 'image/png'
+    if k.endswith('.gif'):
+        return 'image/gif'
+    if k.endswith(('.tif', '.tiff')):
+        return 'image/tiff'
+    if k.endswith('.bmp'):
+        return 'image/bmp'
     return 'image/png'
 
 def _bedrock_analyze_image(image_bytes: bytes, media_type: str = 'image/png') -> str:
@@ -1003,16 +1087,17 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
     try:
         if 'Records' not in event or not event['Records']:
             return {'statusCode': 200, 'body': json.dumps({'ok': True, 'message': 'no records'})}
-
         results = []
         for record in event['Records']:
             try:
                 msg = json.loads(record['body'])
                 document_id = msg['document_id']
-                s3_base_path = msg['s3_base_path']  # s3://bucket/document_extractions/YYYY/MM/DD/{document_id}/
+                s3_base_path = msg['s3_base_path']
                 images = msg.get('images', [])
                 formatted_text_s3_key = msg.get('formatted_text_s3_key')
-
+                module_id = msg.get('module_id')
+                assignment_id = msg.get('assignment_id')
+                student_id = msg.get('student_id')
                 m = re.match(r'^s3://([^/]+)/document_extractions/(\d{4})/(\d{2})/(\d{2})/([^/]+)/?$', s3_base_path.rstrip('/'))
                 if not m:
                     raise Exception(f"Invalid s3_base_path: {s3_base_path}")
@@ -1020,32 +1105,22 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 base_prefix = f"document_extractions/{yyyy}/{mm}/{dd}/{doc_from_path}"
                 if not formatted_text_s3_key:
                     formatted_text_s3_key = f"{base_prefix}/formatted_text.md"
-
-                # Load formatted_text.md
                 obj = s3_client.get_object(Bucket=bucket, Key=formatted_text_s3_key)
                 formatted_text = obj['Body'].read().decode('utf-8')
-
                 analyses_for_manifest: List[Dict[str, Any]] = []
-
                 for i, img in enumerate(images, start=1):
                     placeholder = img['placeholder']
                     img_key = img['s3_key']
                     media_type = _detect_media_type_from_key(img_key)
                     img_obj = s3_client.get_object(Bucket=bucket, Key=img_key)
                     img_bytes = img_obj['Body'].read()
-
                     analysis_md = _bedrock_analyze_image(img_bytes, media_type=media_type)
                     block = _analysis_block(i, placeholder, analysis_md, f"s3://{bucket}/{img_key}")
-
-                    # Replace the exact marker: ![PLACEHOLDER](...)
                     pat_md = re.compile(r'!\[' + re.escape(placeholder) + r'\]\([^)]+\)')
                     formatted_text, n1 = pat_md.subn(block, formatted_text, count=1)
-
                     if n1 == 0:
-                        # fallback: HTML comment markers, if any
                         pat_html = re.compile(r'<!--\s*' + re.escape(placeholder) + r'\s*-->')
                         formatted_text, _ = pat_html.subn(block, formatted_text, count=1)
-
                     analyses_for_manifest.append({
                         "placeholder": placeholder,
                         "s3_image": f"s3://{bucket}/{img_key}",
@@ -1053,8 +1128,6 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                         "sequence_in_page": img.get("sequence_in_page"),
                         "analysis_markdown": analysis_md
                     })
-
-                    # best-effort mark ai_processed in DynamoDB
                     if images_table:
                         try:
                             images_table.update_item(
@@ -1067,37 +1140,33 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                             )
                         except Exception:
                             pass
-
-                # A) base reconstructed file
                 reconstructed_key_base = f"{base_prefix}/reconstructed_text.md"
                 s3_client.put_object(
                     Bucket=bucket, Key=reconstructed_key_base,
                     Body=formatted_text.encode('utf-8'),
                     ContentType='text/markdown; charset=utf-8',
-                    Metadata={'document_id': document_id, 'reconstructed': 'true'}
+                    Metadata={'document_id': document_id, 'reconstructed': 'true', 'module_id': module_id or '', 'assignment_id': assignment_id or '', 'student_id': student_id or ''}
                 )
-
-                # B) legacy UI folder (as in your DOCX screenshot)
                 legacy_prefix = f"reconstructed_documents/{yyyy}/{mm}/{dd}/{document_id}"
-                # final_document.md
                 s3_client.put_object(
                     Bucket=bucket, Key=f"{legacy_prefix}/final_document.md",
                     Body=formatted_text.encode('utf-8'),
                     ContentType='text/markdown; charset=utf-8'
                 )
-                # plain_text.txt
                 s3_client.put_object(
                     Bucket=bucket, Key=f"{legacy_prefix}/plain_text.txt",
                     Body=_md_strip(formatted_text).encode('utf-8'),
                     ContentType='text/plain; charset=utf-8'
                 )
-                # reconstruction_metadata.json
                 recon_meta = {
                     "document_id": document_id,
                     "generated_at": datetime.utcnow().isoformat(),
                     "source_formatted_text": f"s3://{bucket}/{formatted_text_s3_key}",
                     "base_reconstructed_md": f"s3://{bucket}/{reconstructed_key_base}",
                     "images_count": len(images),
+                    "module_id": module_id,
+                    "assignment_id": assignment_id,
+                    "student_id": student_id,
                     "analyses": analyses_for_manifest
                 }
                 s3_client.put_object(
@@ -1105,7 +1174,6 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     Body=json.dumps(recon_meta, indent=2).encode('utf-8'),
                     ContentType='application/json; charset=utf-8'
                 )
-                # reconstruction_summary.txt
                 summary_lines = [
                     f"Document: {document_id}",
                     f"Generated: {datetime.utcnow().isoformat()}",
@@ -1121,23 +1189,19 @@ def image_ai_consumer_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                     Body=("\n".join(summary_lines)).encode('utf-8'),
                     ContentType='text/plain; charset=utf-8'
                 )
-                # comparison_analysis.md (placeholder)
                 s3_client.put_object(
                     Bucket=bucket, Key=f"{legacy_prefix}/comparison_analysis.md",
                     Body="(auto-generated) No baseline document provided for comparison.\n".encode('utf-8'),
                     ContentType='text/markdown; charset=utf-8'
                 )
-
                 results.append({
                     'document_id': document_id,
                     'base_reconstructed': f"s3://{bucket}/{reconstructed_key_base}",
                     'legacy_folder': f"s3://{bucket}/{legacy_prefix}/"
                 })
-
             except Exception as e:
                 logger.error(f"Consumer record failed: {e}")
                 results.append({'error': str(e), 'traceback': traceback.format_exc()})
-
         return {'statusCode': 200, 'body': json.dumps({'ok': True, 'results': results, 'request_id': request_id})}
     except Exception as e:
         logger.error(f"Consumer error: {e}")
